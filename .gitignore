@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Environment variables (secrets)
+.env
+
+# Generated outputs
+test_*.jpg
+test_bg.jpg
+*.tmp
+temp_*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
