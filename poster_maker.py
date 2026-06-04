@@ -31,6 +31,55 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+# ============ 主题色（参考图驱动） ============
+
+# 默认配色（无参考图时沿用原样式）
+DEFAULT_THEME = {
+    "primary": (231, 231, 231),    # 画布/背景底色
+    "accent": (255, 140, 0),       # 强调色/按钮色
+    "text": (0, 0, 0),             # 主文字色
+    "sub_text": (85, 85, 85),      # 副文字色
+    "card_bg": (247, 247, 250),    # 卡片/信息块背景色
+}
+
+
+def _hex_to_rgb(value, fallback):
+    """把 '#RRGGBB' / 'RRGGBB' / [r,g,b] 转成 (r,g,b)，失败回退 fallback"""
+    if value is None:
+        return fallback
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        try:
+            return tuple(int(c) for c in value[:3])
+        except (ValueError, TypeError):
+            return fallback
+    if isinstance(value, str):
+        s = value.strip().lstrip("#")
+        if len(s) == 3:
+            s = "".join(c * 2 for c in s)
+        if len(s) == 6:
+            try:
+                return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                return fallback
+    return fallback
+
+
+def _resolve_theme(plan: dict | None) -> dict:
+    """从 plan.visual_strategy.theme 解析配色，缺失项回退默认值"""
+    raw = ((plan or {}).get("visual_strategy") or {}).get("theme") or {}
+    return {
+        key: _hex_to_rgb(raw.get(key), default)
+        for key, default in DEFAULT_THEME.items()
+    }
+
+
+def _ideal_text_on(bg: tuple) -> tuple:
+    """根据背景明暗自动返回黑/白文字色，保证可读性"""
+    r, g, b = bg[:3]
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return (0, 0, 0) if luminance > 150 else (255, 255, 255)
+
+
 def _fetch_image(url: str) -> Image.Image:
     r = requests.get(url, headers=HEADERS, timeout=10)
     return Image.open(io.BytesIO(r.content)).convert("RGB")
@@ -88,8 +137,14 @@ def _darken(img: Image.Image, alpha: int = 120) -> Image.Image:
 def _plan_visual(plan: dict | None) -> dict:
     visual = dict((plan or {}).get("visual_strategy") or {})
     visual.setdefault("layout_mode", "left_text_right_visual")
+    visual.setdefault("banner_layout_mode", "")
+    visual.setdefault("square_layout_mode", "")
     visual.setdefault("image_strategy", "full_background")
     visual.setdefault("template_id", "generic")
+    visual.setdefault("visual_language", "")
+    visual.setdefault("style_strength", "medium")
+    visual.setdefault("decoration_density", "medium")
+    visual.setdefault("overlay_strength", "medium")
     visual.setdefault("replaceable_slots", [])
     visual.setdefault("fixed_elements", [])
     visual.setdefault("text_safe_area", "")
@@ -129,37 +184,43 @@ def _paste_cover_block(canvas: Image.Image, bg: Image.Image, box, radius: int = 
     ImageDraw.Draw(canvas).rounded_rectangle([x1, y1, x2, y2], radius=radius, outline=(52, 52, 52), width=2)
 
 
-def _draw_home_fixed_decor(draw: ImageDraw.ImageDraw, w: int, h: int):
-    draw.text((w - 210, 6), ">>>", font=_load_font(54), fill=(235, 156, 89))
+def _draw_home_fixed_decor(draw: ImageDraw.ImageDraw, w: int, h: int, accent=(235, 156, 89)):
+    draw.text((w - 210, 6), ">>>", font=_load_font(54), fill=accent)
     for i in range(4):
         bar_x = w - 92
         bar_y = 144 + i * 18
         draw.rounded_rectangle([bar_x, bar_y, bar_x + 10, bar_y + 10], radius=3, fill=(0, 0, 0))
 
 
-def _compose_home_vertical_square(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict) -> Image.Image:
+def _draw_brand_mark(draw: ImageDraw.ImageDraw, x: int, y: int, fill: tuple, text: str = "KUJIALE", size: int = 28):
+    draw.text((x, y), text, font=_load_font(size), fill=fill)
+
+
+def _overlay_alpha(level: str, default: int = 110) -> int:
+    mapping = {"light": 72, "medium": default, "strong": 156}
+    return mapping.get((level or "").lower(), default)
+
+
+def _compose_home_vertical_square(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict) -> Image.Image:
     w, h = SIZES["square"]
-    canvas = Image.new("RGB", (w, h), (233, 233, 233))
+    canvas = Image.new("RGB", (w, h), theme["primary"])
     draw = ImageDraw.Draw(canvas)
     margin_x = 68
 
-    draw.text((margin_x, 24), "KUJIALE", font=_load_font(28), fill=(0, 0, 0))
-    _draw_home_fixed_decor(draw, w, h)
+    draw.text((margin_x, 24), "KUJIALE", font=_load_font(28), fill=theme["text"])
+    _draw_home_fixed_decor(draw, w, h, theme["accent"])
 
     title_font, title_lines = _fit_wrapped_text(
-        title,
-        draw,
+        title, draw,
         max_width=w - margin_x * 2 - 140,
-        max_lines=3,
-        max_size=78,
-        min_size=42,
+        max_lines=3, max_size=78, min_size=42,
     )
     title_y = 72
     title_gap = sum(title_font.getmetrics()) + 6
     for line in title_lines:
         line_bbox = draw.textbbox((0, 0), line, font=title_font)
         line_x = (w - (line_bbox[2] - line_bbox[0])) / 2
-        draw.text((line_x, title_y), line, font=title_font, fill=(0, 0, 0))
+        draw.text((line_x, title_y), line, font=title_font, fill=theme["text"])
         title_y += title_gap
 
     scene_box = [margin_x, int(h * 0.40), w - margin_x, h - 64]
@@ -170,10 +231,11 @@ def _compose_home_vertical_square(bg: Image.Image, title: str, subtitle: str, ct
     chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
     chip_w = chip_bbox[2] - chip_bbox[0] + 48
     chip_h = chip_bbox[3] - chip_bbox[1] + 24
-    chip_x = scene_box[0]
-    chip_y = scene_box[1]
-    draw.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=chip_h // 2, fill=(224, 151, 92), outline=(52, 52, 52), width=2)
-    draw.text((chip_x + 18, chip_y + 11 - chip_bbox[1]), chip_text, font=chip_font, fill=(32, 24, 20))
+    chip_x, chip_y = scene_box[0], scene_box[1]
+    draw.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h],
+                            radius=chip_h // 2, fill=theme["accent"], outline=(52, 52, 52), width=2)
+    draw.text((chip_x + 18, chip_y + 11 - chip_bbox[1]), chip_text, font=chip_font,
+              fill=_ideal_text_on(theme["accent"]))
 
     cta_text = cta.strip() or "立即查看"
     cta_font = _fit_font_size(cta_text, 58, 38, 280, draw)
@@ -184,17 +246,222 @@ def _compose_home_vertical_square(bg: Image.Image, title: str, subtitle: str, ct
     btn_y = scene_box[3] - 96
     btn_w = cta_w + 138
     btn_h = cta_h + 42
-    draw.rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], fill=(0, 0, 0))
-    draw.text((btn_x + 26, btn_y + 18 - cta_bbox[1]), cta_text, font=cta_font, fill=(255, 255, 255))
+    draw.rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], fill=theme["text"])
+    draw.text((btn_x + 26, btn_y + 18 - cta_bbox[1]), cta_text, font=cta_font,
+              fill=_ideal_text_on(theme["text"]))
     circle_d = btn_h - 20
     circle_x = btn_x + btn_w - circle_d - 18
     circle_y = btn_y + 10
-    draw.ellipse([circle_x, circle_y, circle_x + circle_d, circle_y + circle_d], fill=(235, 156, 89))
+    draw.ellipse([circle_x, circle_y, circle_x + circle_d, circle_y + circle_d], fill=theme["accent"])
     arrow_font = _load_font(max(28, circle_d // 2))
     arrow_bbox = draw.textbbox((0, 0), ">", font=arrow_font)
     arrow_x = circle_x + (circle_d - (arrow_bbox[2] - arrow_bbox[0])) / 2
     arrow_y = circle_y + (circle_d - (arrow_bbox[3] - arrow_bbox[1])) / 2 - arrow_bbox[1]
-    draw.text((arrow_x, arrow_y), ">", font=arrow_font, fill=(0, 0, 0))
+    draw.text((arrow_x, arrow_y), ">", font=arrow_font, fill=_ideal_text_on(theme["accent"]))
+    return canvas
+
+
+def _compose_square_editorial(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict) -> Image.Image:
+    w, h = SIZES["square"]
+    canvas = Image.new("RGB", (w, h), theme["primary"])
+    draw = ImageDraw.Draw(canvas)
+    margin = 64
+    left_w = int(w * 0.40)
+    image_box = [left_w + 20, 28, w - 28, h - 28]
+    _paste_cover_block(canvas, bg, image_box, radius=24)
+    draw.rounded_rectangle([margin, 118, left_w - 24, 126], radius=4, fill=theme["accent"])
+    _draw_brand_mark(draw, margin, 34, theme["text"], size=28)
+    _draw_badge(draw, copy_meta.get("badge", ""), margin, 72, fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+    title_font, title_lines = _fit_wrapped_text(title, draw, left_w - margin - 34, 4, 68, 34)
+    y = 178
+    gap = sum(title_font.getmetrics()) + 8
+    for line in title_lines:
+        draw.text((margin, y), line, font=title_font, fill=theme["text"])
+        y += gap
+    sub_font, sub_lines = _fit_wrapped_text(subtitle or "主题内容", draw, left_w - margin - 34, 3, 30, 20)
+    y += 18
+    for line in sub_lines:
+        draw.text((margin, y), line, font=sub_font, fill=theme["sub_text"])
+        y += sum(sub_font.getmetrics()) + 6
+    btn_y = h - 124
+    btn_h = 64
+    btn_w = min(left_w - margin - 10, 260)
+    draw.rounded_rectangle([margin, btn_y, margin + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=theme["accent"])
+    btn_font = _fit_font_size(cta.strip() or "立即查看", 34, 24, btn_w - 48, draw)
+    text = cta.strip() or "立即查看"
+    bbox = draw.textbbox((0, 0), text, font=btn_font)
+    draw.text((margin + (btn_w - (bbox[2] - bbox[0])) / 2, btn_y + (btn_h - (bbox[3] - bbox[1])) / 2 - bbox[1]),
+              text, font=btn_font, fill=_ideal_text_on(theme["accent"]))
+    return canvas
+
+
+def _compose_square_bold(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict, overlay_strength: str) -> Image.Image:
+    w, h = SIZES["square"]
+    canvas = _darken(_prepare_background(bg, (w, h)), alpha=_overlay_alpha(overlay_strength, 124))
+    draw = ImageDraw.Draw(canvas)
+    text_fill = (255, 255, 255)
+    sub_fill = (232, 232, 232)
+    _draw_brand_mark(draw, 52, 32, text_fill, size=28)
+    _draw_badge(draw, copy_meta.get("badge", ""), 52, 72, fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+    title_font, title_lines = _fit_wrapped_text(title, draw, w - 120, 3, 88, 42)
+    y = 220
+    gap = sum(title_font.getmetrics()) + 10
+    for line in title_lines:
+        bbox = draw.textbbox((0, 0), line, font=title_font)
+        x = (w - (bbox[2] - bbox[0])) / 2
+        draw.text((x, y), line, font=title_font, fill=text_fill)
+        y += gap
+    sub_font, sub_lines = _fit_wrapped_text(subtitle or "主题内容", draw, w - 220, 3, 34, 22)
+    y += 12
+    for line in sub_lines:
+        bbox = draw.textbbox((0, 0), line, font=sub_font)
+        x = (w - (bbox[2] - bbox[0])) / 2
+        draw.text((x, y), line, font=sub_font, fill=sub_fill)
+        y += sum(sub_font.getmetrics()) + 6
+    cta_text = cta.strip() or "立即查看"
+    btn_font = _fit_font_size(cta_text, 40, 26, 320, draw)
+    bbox = draw.textbbox((0, 0), cta_text, font=btn_font)
+    btn_w = (bbox[2] - bbox[0]) + 120
+    btn_h = (bbox[3] - bbox[1]) + 34
+    btn_x = (w - btn_w) // 2
+    btn_y = h - 132
+    draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=theme["accent"])
+    draw.text((btn_x + (btn_w - (bbox[2] - bbox[0])) / 2, btn_y + (btn_h - (bbox[3] - bbox[1])) / 2 - bbox[1]),
+              cta_text, font=btn_font, fill=_ideal_text_on(theme["accent"]))
+    return canvas
+
+
+def _compose_square_showcase(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict) -> Image.Image:
+    w, h = SIZES["square"]
+    canvas = Image.new("RGB", (w, h), theme["card_bg"])
+    draw = ImageDraw.Draw(canvas)
+    _draw_brand_mark(draw, 54, 34, theme["text"], size=28)
+    _draw_badge(draw, copy_meta.get("badge", ""), w - 260, 28, fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+    title_font, title_lines = _fit_wrapped_text(title, draw, w - 120, 2, 72, 38)
+    y = 100
+    gap = sum(title_font.getmetrics()) + 8
+    for line in title_lines:
+        draw.text((54, y), line, font=title_font, fill=theme["text"])
+        y += gap
+    chip_font = _fit_font_size(subtitle or "主题内容", 28, 18, 400, draw)
+    chip_text = (subtitle or "主题内容").strip()[:18]
+    chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
+    chip_w = chip_bbox[2] - chip_bbox[0] + 44
+    chip_h = chip_bbox[3] - chip_bbox[1] + 20
+    draw.rounded_rectangle([54, y + 6, 54 + chip_w, y + 6 + chip_h], radius=chip_h // 2, fill=theme["primary"])
+    draw.text((72, y + 16 - chip_bbox[1]), chip_text, font=chip_font, fill=theme["sub_text"])
+    image_box = [54, 250, w - 54, h - 158]
+    _paste_cover_block(canvas, bg, image_box, radius=32)
+    info_y = h - 122
+    draw.rounded_rectangle([54, info_y, w - 54, h - 48], radius=28, fill=theme["text"])
+    cta_font = _fit_font_size(cta.strip() or "立即查看", 34, 24, 220, draw)
+    cta_text = cta.strip() or "立即查看"
+    bbox = draw.textbbox((0, 0), cta_text, font=cta_font)
+    draw.text((80, info_y + 20 - bbox[1]), cta_text, font=cta_font, fill=_ideal_text_on(theme["text"]))
+    draw.text((w - 132, info_y + 12), ">", font=_load_font(46), fill=theme["accent"])
+    return canvas
+
+
+def _compose_banner_editorial(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict, event_meta: dict) -> Image.Image:
+    w, h = SIZES["banner"]
+    canvas = Image.new("RGB", (w, h), theme["primary"])
+    draw = ImageDraw.Draw(canvas)
+    image_box = [int(w * 0.62), 20, w - 24, h - 20]
+    _paste_cover_block(canvas, bg, image_box, radius=20)
+    _draw_brand_mark(draw, 72, 24, theme["text"], size=30)
+    _draw_badge(draw, copy_meta.get("badge", ""), 220, 20, fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+    if event_meta.get("event_time"):
+        draw.text((72, 62), event_meta["event_time"][:26], font=_load_font(20), fill=theme["sub_text"])
+    title_font = _fit_font_size(title, 64, 34, int(w * 0.46), draw)
+    title_bbox = draw.textbbox((0, 0), title, font=title_font)
+    title_y = 112
+    draw.text((72, title_y), title, font=title_font, fill=theme["text"])
+    subtitle_font = _load_font(24)
+    subtitle_lines = _wrap_by_width(subtitle or "", subtitle_font, int(w * 0.44), draw)[:2]
+    sub_y = title_y + (title_bbox[3] - title_bbox[1]) + 18
+    for line in subtitle_lines:
+        draw.text((72, sub_y), line, font=subtitle_font, fill=theme["sub_text"])
+        sub_y += sum(subtitle_font.getmetrics()) + 4
+    btn_w = 200
+    btn_h = 54
+    btn_x = 72
+    btn_y = h - 76
+    draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=theme["accent"])
+    btn_font = _fit_font_size(cta.strip() or "立即查看", 28, 22, btn_w - 36, draw)
+    text = cta.strip() or "立即查看"
+    bbox = draw.textbbox((0, 0), text, font=btn_font)
+    draw.text((btn_x + (btn_w - (bbox[2] - bbox[0])) / 2, btn_y + (btn_h - (bbox[3] - bbox[1])) / 2 - bbox[1]),
+              text, font=btn_font, fill=_ideal_text_on(theme["accent"]))
+    return canvas
+
+
+def _compose_banner_bold(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict, event_meta: dict, overlay_strength: str) -> Image.Image:
+    w, h = SIZES["banner"]
+    canvas = _darken(_prepare_background(bg, (w, h)), alpha=_overlay_alpha(overlay_strength, 116))
+    draw = ImageDraw.Draw(canvas)
+    text_fill = (255, 255, 255)
+    sub_fill = (232, 232, 232)
+    _draw_brand_mark(draw, 68, 26, text_fill, size=30)
+    _draw_badge(draw, copy_meta.get("badge", ""), w - 300, 20, fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+    if event_meta.get("event_time"):
+        draw.text((w - 420, 76), event_meta["event_time"][:26], font=_load_font(20), fill=sub_fill)
+    title_font = _fit_font_size(title, 72, 40, int(w * 0.76), draw)
+    title_bbox = draw.textbbox((0, 0), title, font=title_font)
+    title_x = (w - (title_bbox[2] - title_bbox[0])) / 2
+    title_y = 88
+    draw.text((title_x, title_y), title, font=title_font, fill=text_fill)
+    sub_font = _load_font(22)
+    lines = _wrap_by_width(subtitle or "", sub_font, int(w * 0.56), draw)[:2]
+    sub_y = title_y + (title_bbox[3] - title_bbox[1]) + 12
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=sub_font)
+        draw.text(((w - (bbox[2] - bbox[0])) / 2, sub_y), line, font=sub_font, fill=sub_fill)
+        sub_y += sum(sub_font.getmetrics()) + 3
+    btn_w = 208
+    btn_h = 52
+    btn_x = (w - btn_w) // 2
+    btn_y = h - 72
+    draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=theme["accent"])
+    btn_font = _fit_font_size(cta.strip() or "立即查看", 28, 22, btn_w - 36, draw)
+    text = cta.strip() or "立即查看"
+    bbox = draw.textbbox((0, 0), text, font=btn_font)
+    draw.text((btn_x + (btn_w - (bbox[2] - bbox[0])) / 2, btn_y + (btn_h - (bbox[3] - bbox[1])) / 2 - bbox[1]),
+              text, font=btn_font, fill=_ideal_text_on(theme["accent"]))
+    return canvas
+
+
+def _compose_banner_showcase(bg: Image.Image, title: str, subtitle: str, cta: str, copy_meta: dict, theme: dict, event_meta: dict) -> Image.Image:
+    w, h = SIZES["banner"]
+    canvas = Image.new("RGB", (w, h), theme["card_bg"])
+    draw = ImageDraw.Draw(canvas)
+    left_card = [28, 22, int(w * 0.38), h - 22]
+    right_card = [int(w * 0.41), 22, w - 28, h - 22]
+    draw.rounded_rectangle(left_card, radius=24, fill=theme["primary"])
+    _paste_cover_block(canvas, bg, right_card, radius=24)
+    _draw_brand_mark(draw, left_card[0] + 28, left_card[1] + 22, theme["text"], size=28)
+    _draw_badge(draw, copy_meta.get("badge", ""), left_card[0] + 28, left_card[1] + 58, fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+    if event_meta.get("event_time"):
+        draw.text((left_card[0] + 28, left_card[1] + 106), event_meta["event_time"][:22], font=_load_font(18), fill=theme["sub_text"])
+    title_font = _fit_font_size(title, 44, 28, left_card[2] - left_card[0] - 56, draw)
+    title_lines = _wrap_by_width(title, title_font, left_card[2] - left_card[0] - 56, draw)[:2]
+    y = left_card[1] + 136
+    for line in title_lines:
+        draw.text((left_card[0] + 28, y), line, font=title_font, fill=theme["text"])
+        y += sum(title_font.getmetrics()) + 6
+    sub_font = _load_font(20)
+    for line in _wrap_by_width(subtitle or "", sub_font, left_card[2] - left_card[0] - 56, draw)[:3]:
+        draw.text((left_card[0] + 28, y), line, font=sub_font, fill=theme["sub_text"])
+        y += sum(sub_font.getmetrics()) + 4
+    btn_w = 180
+    btn_h = 46
+    btn_x = left_card[0] + 28
+    btn_y = left_card[3] - btn_h - 22
+    draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=theme["text"])
+    btn_font = _fit_font_size(cta.strip() or "立即查看", 24, 18, btn_w - 28, draw)
+    text = cta.strip() or "立即查看"
+    bbox = draw.textbbox((0, 0), text, font=btn_font)
+    draw.text((btn_x + (btn_w - (bbox[2] - bbox[0])) / 2, btn_y + (btn_h - (bbox[3] - bbox[1])) / 2 - bbox[1]),
+              text, font=btn_font, fill=_ideal_text_on(theme["text"]))
     return canvas
 
 
@@ -249,191 +516,189 @@ def _compose(bg: Image.Image, title: str, subtitle: str, cta: str, size_key: str
     visual = _plan_visual(plan)
     copy_meta = _plan_copy(plan)
     event_meta = _plan_event(plan)
+    theme = _resolve_theme(plan)          # ← 参考图主题色（无则用默认值）
     layout_mode = visual.get("layout_mode", "left_text_right_visual")
     image_strategy = visual.get("image_strategy", "full_background")
     template_id = visual.get("template_id", "generic")
+    banner_layout_mode = visual.get("banner_layout_mode") or layout_mode
+    square_layout_mode = visual.get("square_layout_mode") or layout_mode
+    overlay_strength = visual.get("overlay_strength", "medium")
+
     if size_key == "square":
-        if template_id == "home_vertical_promo":
-            return _compose_home_vertical_square(source_bg, title, subtitle, cta, copy_meta)
-        canvas = Image.new("RGB", (w, h), (231, 231, 231))
+        if template_id in ("reference_showcase", "home_vertical_promo"):
+            return _compose_home_vertical_square(source_bg, title, subtitle, cta, copy_meta, theme)
+        if template_id == "reference_editorial":
+            return _compose_square_editorial(source_bg, title, subtitle, cta, copy_meta, theme)
+        if template_id == "reference_bold":
+            return _compose_square_bold(source_bg, title, subtitle, cta, copy_meta, theme, overlay_strength)
+        if square_layout_mode == "centered":
+            return _compose_square_bold(source_bg, title, subtitle, cta, copy_meta, theme, overlay_strength)
+        if square_layout_mode == "top_text_bottom_visual":
+            return _compose_square_showcase(source_bg, title, subtitle, cta, copy_meta, theme)
+        canvas = Image.new("RGB", (w, h), theme["primary"])
         draw = ImageDraw.Draw(canvas)
         margin_x = 68
-        brand_font = _load_font(28)
-        draw.text((margin_x, 24), "KUJIALE", font=brand_font, fill=(0, 0, 0))
-        _draw_badge(draw, copy_meta.get("badge", ""), margin_x + 148, 18)
-
-        deco_font = _load_font(54)
-        draw.text((w - 220, 4), ">>>", font=deco_font, fill=(235, 156, 89))
+        draw.text((margin_x, 24), "KUJIALE", font=_load_font(28), fill=theme["text"])
+        _draw_badge(draw, copy_meta.get("badge", ""), margin_x + 148, 18, fill=theme["accent"],
+                    text_fill=_ideal_text_on(theme["accent"]))
+        draw.text((w - 220, 4), ">>>", font=_load_font(54), fill=theme["accent"])
 
         if layout_mode == "left_text_right_visual":
             title_font = _load_font(72)
             title_lines = _wrap_by_width(title, title_font, 430, draw)[:3]
             title_y = 110
             for line in title_lines:
-                draw.text((margin_x, title_y), line, font=title_font, fill=(0, 0, 0))
+                draw.text((margin_x, title_y), line, font=title_font, fill=theme["text"])
                 title_y += sum(title_font.getmetrics()) + 6
-
             chip_text = (subtitle or "主题内容").strip()[:16]
             chip_font = _fit_font_size(chip_text, 32, 24, 320, draw)
             chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
             chip_w = chip_bbox[2] - chip_bbox[0] + 48
             chip_h = chip_bbox[3] - chip_bbox[1] + 24
-            draw.rounded_rectangle([margin_x, title_y + 8, margin_x + chip_w, title_y + 8 + chip_h], radius=chip_h // 2, fill=(224, 151, 92))
-            draw.text((margin_x + 18, title_y + 20 - chip_bbox[1]), chip_text, font=chip_font, fill=(32, 24, 20))
-
+            draw.rounded_rectangle([margin_x, title_y + 8, margin_x + chip_w, title_y + 8 + chip_h],
+                                    radius=chip_h // 2, fill=theme["accent"])
+            draw.text((margin_x + 18, title_y + 20 - chip_bbox[1]), chip_text, font=chip_font,
+                      fill=_ideal_text_on(theme["accent"]))
             image_box = [470, 150, w - 64, h - 88]
             _paste_cover_block(canvas, bg, image_box, radius=28)
             btn_y = h - 164
             btn_x = margin_x
         else:
-            title_top = 72
             for i in range(4):
-                bar_x = w - 118
-                bar_y = 144 + i * 18
-                draw.rounded_rectangle([bar_x, bar_y, bar_x + 10, bar_y + 10], radius=3, fill=(0, 0, 0))
-
+                draw.rounded_rectangle([w - 118, 144 + i * 18, w - 108, 154 + i * 18], radius=3, fill=theme["text"])
             title_font = _load_font(74)
             title_lines = _wrap_by_width(title, title_font, w - margin_x * 2 - 80, draw)[:2]
-            title_y = title_top
-            title_gap = sum(title_font.getmetrics()) + 6
+            title_y = 72
             for line in title_lines:
-                draw.text((margin_x, title_y), line, font=title_font, fill=(0, 0, 0))
-                title_y += title_gap
-
-            image_x = margin_x
-            image_y = title_y + 18
-            image_w = w - margin_x * 2
+                draw.text((margin_x, title_y), line, font=title_font, fill=theme["text"])
+                title_y += sum(title_font.getmetrics()) + 6
+            image_x, image_y = margin_x, title_y + 18
             image_h = 626
-            _paste_cover_block(canvas, bg, [image_x, image_y, image_x + image_w, image_y + image_h], radius=0 if image_strategy == "full_background" else 24)
-
-            chip_text = (subtitle or "如何做异形门衣柜？").strip()[:14]
+            _paste_cover_block(canvas, bg, [image_x, image_y, image_x + w - margin_x * 2, image_y + image_h],
+                               radius=0 if image_strategy == "full_background" else 24)
+            chip_text = (subtitle or "").strip()[:14]
             chip_font = _fit_font_size(chip_text, 34, 24, 300, draw)
             chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
             chip_w = chip_bbox[2] - chip_bbox[0] + 52
             chip_h = chip_bbox[3] - chip_bbox[1] + 28
-            chip_x = image_x
-            chip_y = image_y
-            draw.rounded_rectangle([chip_x, chip_y, chip_x + chip_w, chip_y + chip_h], radius=chip_h // 2, fill=(224, 151, 92), outline=(52, 52, 52), width=2)
-            draw.text((chip_x + 18, chip_y + 12 - chip_bbox[1]), chip_text, font=chip_font, fill=(32, 24, 20))
+            draw.rounded_rectangle([image_x, image_y, image_x + chip_w, image_y + chip_h],
+                                    radius=chip_h // 2, fill=theme["accent"], outline=(52, 52, 52), width=2)
+            draw.text((image_x + 18, image_y + 12 - chip_bbox[1]), chip_text, font=chip_font,
+                      fill=_ideal_text_on(theme["accent"]))
             btn_y = image_y + image_h - 132
             btn_x = 32
             if event_meta.get("event_time"):
-                event_font = _load_font(24)
-                draw.text((w - 360, 40), event_meta["event_time"][:24], font=event_font, fill=(90, 90, 100))
+                draw.text((w - 360, 40), event_meta["event_time"][:24], font=_load_font(24), fill=theme["sub_text"])
 
         cta_text = cta.strip() or "立即查看"
         cta_font = _fit_font_size(cta_text, 58, 38, 280, draw)
         cta_bbox = draw.textbbox((0, 0), cta_text, font=cta_font)
-        cta_w = cta_bbox[2] - cta_bbox[0]
-        cta_h = cta_bbox[3] - cta_bbox[1]
-        btn_w = cta_w + 138
-        btn_h = cta_h + 42
-        draw.rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], fill=(0, 0, 0))
-        draw.text((btn_x + 26, btn_y + 18 - cta_bbox[1]), cta_text, font=cta_font, fill=(255, 255, 255))
-
+        cta_w, cta_h = cta_bbox[2] - cta_bbox[0], cta_bbox[3] - cta_bbox[1]
+        btn_w, btn_h = cta_w + 138, cta_h + 42
+        draw.rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], fill=theme["text"])
+        draw.text((btn_x + 26, btn_y + 18 - cta_bbox[1]), cta_text, font=cta_font,
+                  fill=_ideal_text_on(theme["text"]))
         circle_d = btn_h - 20
-        circle_x = btn_x + btn_w - circle_d - 18
-        circle_y = btn_y + 10
-        draw.ellipse([circle_x, circle_y, circle_x + circle_d, circle_y + circle_d], fill=(235, 156, 89))
-        arrow_font = _load_font(max(28, circle_d // 2))
-        arrow_bbox = draw.textbbox((0, 0), ">", font=arrow_font)
-        arrow_x = circle_x + (circle_d - (arrow_bbox[2] - arrow_bbox[0])) / 2
-        arrow_y = circle_y + (circle_d - (arrow_bbox[3] - arrow_bbox[1])) / 2 - arrow_bbox[1]
-        draw.text((arrow_x, arrow_y), ">", font=arrow_font, fill=(0, 0, 0))
+        cx, cy = btn_x + btn_w - circle_d - 18, btn_y + 10
+        draw.ellipse([cx, cy, cx + circle_d, cy + circle_d], fill=theme["accent"])
+        af = _load_font(max(28, circle_d // 2))
+        ab = draw.textbbox((0, 0), ">", font=af)
+        draw.text((cx + (circle_d - (ab[2] - ab[0])) / 2, cy + (circle_d - (ab[3] - ab[1])) / 2 - ab[1]),
+                  ">", font=af, fill=_ideal_text_on(theme["accent"]))
         return canvas
 
-    if image_strategy == "full_background":
-        bg = _darken(source_bg)
+    # banner（及兜底）
+    full_bg = image_strategy == "full_background"
+    if template_id == "reference_editorial":
+        return _compose_banner_editorial(source_bg, title, subtitle, cta, copy_meta, theme, event_meta)
+    if template_id == "reference_bold":
+        return _compose_banner_bold(source_bg, title, subtitle, cta, copy_meta, theme, event_meta, overlay_strength)
+    if template_id in ("reference_showcase", "home_vertical_promo"):
+        return _compose_banner_showcase(source_bg, title, subtitle, cta, copy_meta, theme, event_meta)
+    if banner_layout_mode == "centered":
+        return _compose_banner_bold(source_bg, title, subtitle, cta, copy_meta, theme, event_meta, overlay_strength)
+    if banner_layout_mode == "top_text_bottom_visual":
+        return _compose_banner_showcase(source_bg, title, subtitle, cta, copy_meta, theme, event_meta)
+    if full_bg:
+        bg = _darken(source_bg, alpha=_overlay_alpha(overlay_strength, 120))
     else:
-        bg = Image.new("RGB", (w, h), (240, 240, 242))
+        bg = Image.new("RGB", (w, h), theme["card_bg"])
     draw = ImageDraw.Draw(bg)
 
     if size_key == "banner":
-        brand_fill = (255, 255, 255, 220) if image_strategy == "full_background" else (0, 0, 0)
-        text_fill = "white" if image_strategy == "full_background" else (0, 0, 0)
-        sub_fill = (220, 220, 220) if image_strategy == "full_background" else (85, 85, 85)
+        text_fill = (255, 255, 255) if full_bg else theme["text"]
+        sub_fill = (220, 220, 220) if full_bg else theme["sub_text"]
         brand_font = _load_font(max(28, h // 10))
 
         if layout_mode == "centered":
-            if image_strategy == "full_background":
-                draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=brand_fill)
-            else:
-                draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=(0, 0, 0))
-            _draw_badge(draw, copy_meta.get("badge", ""), int(w * 0.5 - 120), 20, fill=(255, 255, 255) if image_strategy == "full_background" else (224, 151, 92))
+            draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=text_fill)
+            _draw_badge(draw, copy_meta.get("badge", ""), int(w * 0.5 - 120), 20,
+                        fill=(255, 255, 255) if full_bg else theme["accent"],
+                        text_fill=(0, 0, 0) if full_bg else _ideal_text_on(theme["accent"]))
             title_font = _load_font(max(40, h // 6))
             title_bbox = draw.textbbox((0, 0), title, font=title_font)
-            tx = (w - (title_bbox[2] - title_bbox[0])) / 2
-            draw.text((tx, h * 0.30), title, font=title_font, fill=text_fill)
+            draw.text(((w - (title_bbox[2] - title_bbox[0])) / 2, h * 0.30), title, font=title_font, fill=text_fill)
             wrapped = "\n".join(textwrap.wrap(subtitle, 40))
             sub_font = _load_font(max(24, h // 10))
             sub_bbox = draw.multiline_textbbox((0, 0), wrapped, font=sub_font, spacing=4)
-            sx = (w - (sub_bbox[2] - sub_bbox[0])) / 2
-            draw.multiline_text((sx, h * 0.54), wrapped, font=sub_font, fill=sub_fill, spacing=4, align="center")
+            draw.multiline_text(((w - (sub_bbox[2] - sub_bbox[0])) / 2, h * 0.54), wrapped,
+                                font=sub_font, fill=sub_fill, spacing=4, align="center")
             btn_anchor = "center"
             if event_meta.get("event_time"):
-                event_font = _load_font(22)
-                event_bbox = draw.textbbox((0, 0), event_meta["event_time"][:24], font=event_font)
-                ex = (w - (event_bbox[2] - event_bbox[0])) / 2
-                draw.text((ex, h * 0.16), event_meta["event_time"][:24], font=event_font, fill=sub_fill)
+                ef = _load_font(22)
+                eb = draw.textbbox((0, 0), event_meta["event_time"][:24], font=ef)
+                draw.text(((w - (eb[2] - eb[0])) / 2, h * 0.16), event_meta["event_time"][:24], font=ef, fill=sub_fill)
         elif layout_mode == "top_text_bottom_visual":
-            if image_strategy == "full_background":
+            if full_bg:
                 bg = _darken(source_bg, alpha=90)
                 draw = ImageDraw.Draw(bg)
             else:
-                draw.rectangle([0, 0, w, h], fill=(246, 246, 248))
+                draw.rectangle([0, 0, w, h], fill=theme["card_bg"])
                 _paste_cover_block(bg, source_bg, [int(w * 0.70), 24, int(w * 0.95), h - 24], radius=22)
-            draw.text((w * 0.04, 24), "KUJIALE", font=brand_font, fill=brand_fill if image_strategy == "full_background" else (0, 0, 0))
-            _draw_badge(draw, copy_meta.get("badge", ""), int(w * 0.18), 18)
-            title_font = _load_font(max(34, h // 5))
-            draw.text((w * 0.04, 92), title, font=title_font, fill=text_fill if image_strategy == "full_background" else (0, 0, 0))
+            draw.text((w * 0.04, 24), "KUJIALE", font=brand_font, fill=text_fill)
+            _draw_badge(draw, copy_meta.get("badge", ""), int(w * 0.18), 18,
+                        fill=theme["accent"], text_fill=_ideal_text_on(theme["accent"]))
+            draw.text((w * 0.04, 92), title, font=_load_font(max(34, h // 5)), fill=text_fill)
             info_bar_y = int(h * 0.63)
-            draw.rounded_rectangle([int(w * 0.04), info_bar_y, int(w * 0.66), h - 26], radius=20, fill=(255, 255, 255) if image_strategy != "full_background" else (20, 20, 22))
-            info_fill = (65, 65, 70) if image_strategy != "full_background" else (235, 235, 235)
-            sub_font = _load_font(max(22, h // 11))
-            sub_text = "\n".join(textwrap.wrap(subtitle, 34))
-            draw.multiline_text((w * 0.06, info_bar_y + 14), sub_text, font=sub_font, fill=info_fill, spacing=4)
+            bar_fill = (20, 20, 22) if full_bg else (255, 255, 255)
+            draw.rounded_rectangle([int(w * 0.04), info_bar_y, int(w * 0.66), h - 26], radius=20, fill=bar_fill)
+            info_fill = (235, 235, 235) if full_bg else theme["sub_text"]
+            draw.multiline_text((w * 0.06, info_bar_y + 14),
+                                "\n".join(textwrap.wrap(subtitle, 34)),
+                                font=_load_font(max(22, h // 11)), fill=info_fill, spacing=4)
             if event_meta.get("event_time"):
-                event_font = _load_font(20)
-                draw.text((w * 0.40, 32), event_meta["event_time"][:24], font=event_font, fill=info_fill if image_strategy != "full_background" else (255, 255, 255))
+                draw.text((w * 0.40, 32), event_meta["event_time"][:24], font=_load_font(20), fill=info_fill)
             btn_anchor = "right"
         else:
-            if image_strategy == "full_background":
-                draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=brand_fill)
-                title_x = w * 0.04
-                title_y = h * 0.35
+            if full_bg:
+                draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=text_fill)
+                title_x, title_y = w * 0.04, h * 0.35
             else:
-                draw.rectangle([0, 0, w, h], fill=(239, 239, 241))
+                draw.rectangle([0, 0, w, h], fill=theme["card_bg"])
                 _paste_cover_block(bg, source_bg, [int(w * 0.58), 22, int(w * 0.96), h - 22], radius=24)
-                draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=(0, 0, 0))
-                title_x = w * 0.04
-                title_y = h * 0.28
-            _draw_badge(draw, copy_meta.get("badge", ""), int(w * 0.04), 22, fill=(255, 255, 255) if image_strategy == "full_background" else (224, 151, 92))
-            title_size = max(36, h // 6)
-            draw.text((title_x, title_y), title, font=_load_font(title_size), fill=text_fill)
-            sub_size = max(24, h // 10)
-            wrapped = "\n".join(textwrap.wrap(subtitle, 34 if image_strategy != "full_background" else 40))
-            draw.text((w * 0.04, h * (0.55 if image_strategy == "full_background" else 0.56)), wrapped, font=_load_font(sub_size), fill=sub_fill)
-            btn_anchor = "right" if image_strategy == "full_background" else "left"
+                draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=theme["text"])
+                title_x, title_y = w * 0.04, h * 0.28
+            _draw_badge(draw, copy_meta.get("badge", ""), int(w * 0.04), 22,
+                        fill=(255, 255, 255) if full_bg else theme["accent"],
+                        text_fill=(0, 0, 0) if full_bg else _ideal_text_on(theme["accent"]))
+            draw.text((title_x, title_y), title, font=_load_font(max(36, h // 6)), fill=text_fill)
+            draw.text((w * 0.04, h * (0.55 if full_bg else 0.56)),
+                      "\n".join(textwrap.wrap(subtitle, 34 if not full_bg else 40)),
+                      font=_load_font(max(24, h // 10)), fill=sub_fill)
+            btn_anchor = "right" if full_bg else "left"
             if event_meta.get("event_time"):
-                event_font = _load_font(20)
-                draw.text((w * 0.04, h * 0.20), event_meta["event_time"][:24], font=event_font, fill=sub_fill if image_strategy == "full_background" else (110, 110, 115))
+                draw.text((w * 0.04, h * 0.20), event_meta["event_time"][:24],
+                          font=_load_font(20), fill=sub_fill if full_bg else theme["sub_text"])
 
         cta_text = cta.strip() or "立即查看"
         cta_font = _fit_font_size(cta_text, max(28, h // 10), 24, int(w * 0.16), draw)
         cta_bbox = draw.textbbox((0, 0), cta_text, font=cta_font)
-        cta_w = cta_bbox[2] - cta_bbox[0]
-        cta_h = cta_bbox[3] - cta_bbox[1]
-        pad_x = max(22, w // 120)
-        pad_y = max(12, h // 22)
-        btn_w = cta_w + pad_x * 2
-        btn_h = cta_h + pad_y * 2
+        cta_w, cta_h = cta_bbox[2] - cta_bbox[0], cta_bbox[3] - cta_bbox[1]
+        pad_x, pad_y = max(22, w // 120), max(12, h // 22)
+        btn_w, btn_h = cta_w + pad_x * 2, cta_h + pad_y * 2
         bottom_safe = max(18, int(h * 0.09))
-        if btn_anchor == "center":
-            btn_x = int((w - btn_w) / 2)
-        elif btn_anchor == "left":
-            btn_x = int(w * 0.04)
-        else:
-            btn_x = int(w * 0.96 - btn_w)
+        btn_x = int((w - btn_w) / 2) if btn_anchor == "center" else \
+                int(w * 0.04) if btn_anchor == "left" else int(w * 0.96 - btn_w)
         btn_y = h - bottom_safe - btn_h
         if layout_mode == "top_text_bottom_visual":
             btn_y = h - max(16, int(h * 0.08)) - btn_h
@@ -441,10 +706,9 @@ def _compose(bg: Image.Image, title: str, subtitle: str, cta: str, size_key: str
                 btn_x = int(w * 0.66 - btn_w)
         elif layout_mode == "centered":
             btn_y = h - max(18, int(h * 0.10)) - btn_h
-        draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=(255, 140, 0))
-        text_x = btn_x + (btn_w - cta_w) / 2
-        text_y = btn_y + (btn_h - cta_h) / 2 - cta_bbox[1]
-        draw.text((text_x, text_y), cta_text, font=cta_font, fill="white")
+        draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=theme["accent"])
+        draw.text((btn_x + (btn_w - cta_w) / 2, btn_y + (btn_h - cta_h) / 2 - cta_bbox[1]),
+                  cta_text, font=cta_font, fill=_ideal_text_on(theme["accent"]))
         return bg
 
     return bg
@@ -488,12 +752,19 @@ def _draw_wrapped(draw, text, font, x, y, max_w, fill, line_gap=10):
     return y
 
 
-def make_detail_page(bg_source, detail: dict, width: int = 1080) -> Image.Image:
+def make_detail_page(bg_source, detail: dict, width: int = 1080, plan: dict = None) -> Image.Image:
     """
     生成详情页竖向长图：头图区 + 多卖点板块 + CTA
     bg_source : 头图背景（URL字符串 或 PIL Image）
     detail    : ai_writer.generate_detail() 返回的结构化内容
+    plan      : poster_plan，用于读取参考图主题色（可选）
     """
+    theme = _resolve_theme(plan)
+    accent = theme["accent"]
+    card_bg = theme["card_bg"]
+    dark = theme["text"]
+    gray = theme["sub_text"]
+
     pad = int(width * 0.06)          # 左右留白
     content_w = width - pad * 2
     head_h = 720                     # 头图区高度
@@ -551,14 +822,14 @@ def make_detail_page(bg_source, detail: dict, width: int = 1080) -> Image.Image:
     y = head_h + 40
     for sec, ch in zip(sections, card_heights):
         # 卡片底
-        d.rounded_rectangle([pad, y, width - pad, y + ch], radius=20, fill=CARD_BG)
-        # 左侧橙色竖条
-        d.rounded_rectangle([pad, y + card_pad, pad + 10, y + ch - card_pad], radius=5, fill=ORANGE)
+        d.rounded_rectangle([pad, y, width - pad, y + ch], radius=20, fill=card_bg)
+        # 左侧强调色竖条
+        d.rounded_rectangle([pad, y + card_pad, pad + 10, y + ch - card_pad], radius=5, fill=accent)
         tx = pad + card_pad + 20
         ty = y + card_pad
-        d.text((tx, ty), sec.get("heading", ""), font=f_sec_h, fill=DARK)
+        d.text((tx, ty), sec.get("heading", ""), font=f_sec_h, fill=dark)
         ty += sec_head_h + 18
-        _draw_wrapped(d, sec.get("body", ""), f_sec_b, tx, ty, content_w - card_pad * 2 - 20, GRAY, line_gap=12)
+        _draw_wrapped(d, sec.get("body", ""), f_sec_b, tx, ty, content_w - card_pad * 2 - 20, gray, line_gap=12)
         y += ch + card_gap
 
     # CTA 按钮（居中）
@@ -570,8 +841,8 @@ def make_detail_page(bg_source, detail: dict, width: int = 1080) -> Image.Image:
     btn_h = cta_h + 56
     btn_x = (width - btn_w) // 2
     btn_y = y + 30
-    d.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=ORANGE)
-    d.text((btn_x + (btn_w - cta_w) // 2, btn_y + (btn_h - cta_h) // 2 - cta_bbox[1]), cta_text, font=f_cta, fill="white")
+    d.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=accent)
+    d.text((btn_x + (btn_w - cta_w) // 2, btn_y + (btn_h - cta_h) // 2 - cta_bbox[1]), cta_text, font=f_cta, fill=_ideal_text_on(accent))
 
     return canvas
 
