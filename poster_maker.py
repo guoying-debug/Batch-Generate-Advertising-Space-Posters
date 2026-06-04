@@ -5,7 +5,7 @@
 import io
 import textwrap
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 SIZES = {
     "banner": (2560, 320),
@@ -34,6 +34,16 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 def _fetch_image(url: str) -> Image.Image:
     r = requests.get(url, headers=HEADERS, timeout=10)
     return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+
+def _fit_font_size(text: str, max_size: int, min_size: int, max_width: int, draw: ImageDraw.ImageDraw) -> ImageFont.FreeTypeFont:
+    """在给定宽度内寻找可容纳文本的最大字号"""
+    for size in range(max_size, min_size - 1, -2):
+        font = _load_font(size)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if (bbox[2] - bbox[0]) <= max_width:
+            return font
+    return _load_font(min_size)
 
 
 def _darken(img: Image.Image, alpha: int = 120) -> Image.Image:
@@ -80,31 +90,238 @@ def make_poster_any(bg_source, title, subtitle, cta, size_key="banner") -> Image
 def _compose(bg: Image.Image, title: str, subtitle: str, cta: str, size_key: str) -> Image.Image:
     """内部排版逻辑，bg 已是目标尺寸 RGB Image"""
     w, h = bg.size
+    if size_key == "square":
+        canvas = Image.new("RGB", (w, h), (231, 231, 231))
+        draw = ImageDraw.Draw(canvas)
+
+        margin_x = 68
+        title_top = 72
+
+        brand_font = _load_font(28)
+        draw.text((margin_x, 24), "KUJIALE", font=brand_font, fill=(0, 0, 0))
+
+        deco_font = _load_font(54)
+        draw.text((w - 220, 4), ">>>", font=deco_font, fill=(235, 156, 89))
+
+        for i in range(4):
+            bar_x = w - 118
+            bar_y = 144 + i * 18
+            draw.rounded_rectangle([bar_x, bar_y, bar_x + 10, bar_y + 10], radius=3, fill=(0, 0, 0))
+
+        title_font = _load_font(74)
+        title_lines = _wrap_by_width(title, title_font, w - margin_x * 2 - 80, draw)[:2]
+        title_y = title_top
+        title_gap = sum(title_font.getmetrics()) + 6
+        for line in title_lines:
+            draw.text((margin_x, title_y), line, font=title_font, fill=(0, 0, 0))
+            title_y += title_gap
+
+        image_x = margin_x
+        image_y = title_y + 18
+        image_w = w - margin_x * 2
+        image_h = 626
+        hero = ImageOps.fit(bg, (image_w, image_h), method=Image.LANCZOS, centering=(0.5, 0.5))
+        canvas.paste(hero, (image_x, image_y))
+        draw.rectangle([image_x, image_y, image_x + image_w, image_y + image_h], outline=(52, 52, 52), width=2)
+
+        chip_text = (subtitle or "如何做异形门衣柜？").strip()
+        chip_text = chip_text[:14]
+        chip_font = _fit_font_size(chip_text, 34, 24, 300, draw)
+        chip_bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
+        chip_w = chip_bbox[2] - chip_bbox[0] + 52
+        chip_h = chip_bbox[3] - chip_bbox[1] + 28
+        chip_x = image_x
+        chip_y = image_y
+        draw.rounded_rectangle(
+            [chip_x, chip_y, chip_x + chip_w, chip_y + chip_h],
+            radius=chip_h // 2,
+            fill=(224, 151, 92),
+            outline=(52, 52, 52),
+            width=2,
+        )
+        draw.text((chip_x + 18, chip_y + 12 - chip_bbox[1]), chip_text, font=chip_font, fill=(32, 24, 20))
+
+        cta_text = cta.strip() or "立即查看"
+        cta_font = _fit_font_size(cta_text, 58, 38, 280, draw)
+        cta_bbox = draw.textbbox((0, 0), cta_text, font=cta_font)
+        cta_w = cta_bbox[2] - cta_bbox[0]
+        cta_h = cta_bbox[3] - cta_bbox[1]
+        btn_x = 32
+        btn_y = image_y + image_h - 132
+        btn_w = cta_w + 138
+        btn_h = cta_h + 42
+        draw.rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], fill=(0, 0, 0))
+        draw.text((btn_x + 26, btn_y + 18 - cta_bbox[1]), cta_text, font=cta_font, fill=(255, 255, 255))
+
+        circle_d = btn_h - 20
+        circle_x = btn_x + btn_w - circle_d - 18
+        circle_y = btn_y + 10
+        draw.ellipse([circle_x, circle_y, circle_x + circle_d, circle_y + circle_d], fill=(235, 156, 89))
+        arrow_font = _load_font(max(28, circle_d // 2))
+        arrow_bbox = draw.textbbox((0, 0), ">", font=arrow_font)
+        arrow_x = circle_x + (circle_d - (arrow_bbox[2] - arrow_bbox[0])) / 2
+        arrow_y = circle_y + (circle_d - (arrow_bbox[3] - arrow_bbox[1])) / 2 - arrow_bbox[1]
+        draw.text((arrow_x, arrow_y), ">", font=arrow_font, fill=(0, 0, 0))
+        return canvas
+
     bg = _darken(bg)
     draw = ImageDraw.Draw(bg)
 
-    brand_font = _load_font(max(28, h // 10))
-    draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=(255, 255, 255, 220))
+    if size_key == "banner":
+        brand_font = _load_font(max(28, h // 10))
+        draw.text((w * 0.04, h * 0.12), "KUJIALE", font=brand_font, fill=(255, 255, 255, 220))
 
-    title_size = max(36, h // 6) if size_key == "banner" else max(60, h // 12)
-    draw.text((w * 0.04, h * 0.35), title, font=_load_font(title_size), fill="white")
+        title_size = max(36, h // 6)
+        draw.text((w * 0.04, h * 0.35), title, font=_load_font(title_size), fill="white")
 
-    sub_size = max(24, h // 10) if size_key == "banner" else max(38, h // 20)
-    wrap_width = 40 if size_key == "banner" else 28
-    wrapped = "\n".join(textwrap.wrap(subtitle, wrap_width))
-    sub_y = h * 0.58 if size_key == "banner" else h * 0.52
-    draw.text((w * 0.04, sub_y), wrapped, font=_load_font(sub_size), fill=(220, 220, 220))
+        sub_size = max(24, h // 10)
+        wrapped = "\n".join(textwrap.wrap(subtitle, 40))
+        draw.text((w * 0.04, h * 0.58), wrapped, font=_load_font(sub_size), fill=(220, 220, 220))
 
-    cta_font = _load_font(max(28, h // 9))
-    cta_text = f">>> {cta}"
-    cta_bbox = draw.textbbox((0, 0), cta_text, font=cta_font)
-    cta_w = cta_bbox[2] - cta_bbox[0]
-    cta_x = w - cta_w - w * 0.04
-    cta_y = h * 0.4
-    pad = 12
-    draw.rectangle([cta_x - pad, cta_y - pad, cta_x + cta_w + pad, cta_y + (cta_bbox[3] - cta_bbox[1]) + pad], fill=(255, 140, 0))
-    draw.text((cta_x, cta_y), cta_text, font=cta_font, fill="white")
+        cta_text = cta.strip() or "立即查看"
+        cta_font = _fit_font_size(cta_text, max(28, h // 10), 24, int(w * 0.16), draw)
+        cta_bbox = draw.textbbox((0, 0), cta_text, font=cta_font)
+        cta_w = cta_bbox[2] - cta_bbox[0]
+        cta_h = cta_bbox[3] - cta_bbox[1]
+        pad_x = max(22, w // 120)
+        pad_y = max(12, h // 22)
+        btn_w = cta_w + pad_x * 2
+        btn_h = cta_h + pad_y * 2
+        btn_x = int(w * 0.96 - btn_w)
+        btn_y = int(h * 0.5 - btn_h / 2)
+        draw.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=(255, 140, 0))
+        text_x = btn_x + (btn_w - cta_w) / 2
+        text_y = btn_y + (btn_h - cta_h) / 2 - cta_bbox[1]
+        draw.text((text_x, text_y), cta_text, font=cta_font, fill="white")
+        return bg
+
     return bg
+
+
+# ============ 详情页长图 ============
+
+ORANGE = (255, 140, 0)
+DARK = (40, 40, 50)
+GRAY = (90, 90, 100)
+CARD_BG = (247, 247, 250)
+
+
+def _wrap_by_width(text, font, max_w, draw):
+    """按像素宽度换行，支持中英文混排"""
+    lines, cur = [], ""
+    for ch in text:
+        if ch == "\n":
+            lines.append(cur)
+            cur = ""
+            continue
+        test = cur + ch
+        if draw.textlength(test, font=font) <= max_w:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = ch
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _draw_wrapped(draw, text, font, x, y, max_w, fill, line_gap=10):
+    """绘制自动换行文本，返回绘制后的 y 坐标"""
+    lines = _wrap_by_width(text, font, max_w, draw)
+    asc, desc = font.getmetrics()
+    line_h = asc + desc
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        y += line_h + line_gap
+    return y
+
+
+def make_detail_page(bg_source, detail: dict, width: int = 1080) -> Image.Image:
+    """
+    生成详情页竖向长图：头图区 + 多卖点板块 + CTA
+    bg_source : 头图背景（URL字符串 或 PIL Image）
+    detail    : ai_writer.generate_detail() 返回的结构化内容
+    """
+    pad = int(width * 0.06)          # 左右留白
+    content_w = width - pad * 2
+    head_h = 720                     # 头图区高度
+
+    headline = detail.get("headline", "")
+    subhead = detail.get("subhead", "")
+    sections = detail.get("sections", []) or []
+    cta = detail.get("cta", "立即体验")
+
+    # 字体
+    f_brand = _load_font(34)
+    f_head = _load_font(66)
+    f_sub = _load_font(36)
+    f_sec_h = _load_font(46)
+    f_sec_b = _load_font(32)
+    f_cta = _load_font(44)
+
+    # —— 先用临时画布测量各板块高度，算出总高 ——
+    probe = ImageDraw.Draw(Image.new("RGB", (width, 10)))
+    sec_line_h = sum(f_sec_b.getmetrics()) + 12
+    sec_head_h = sum(f_sec_h.getmetrics())
+    card_gap = 36
+    card_pad = 32
+
+    card_heights = []
+    for sec in sections:
+        body_lines = _wrap_by_width(sec.get("body", ""), f_sec_b, content_w - card_pad * 2 - 20, probe)
+        h = card_pad + sec_head_h + 18 + len(body_lines) * sec_line_h + card_pad
+        card_heights.append(h)
+
+    cta_block_h = 200
+    total_h = head_h + 40 + sum(card_heights) + card_gap * len(card_heights) + cta_block_h
+
+    # —— 画布 ——
+    canvas = Image.new("RGB", (width, total_h), (255, 255, 255))
+
+    # 头图区
+    if isinstance(bg_source, Image.Image):
+        head_bg = bg_source.convert("RGB").resize((width, head_h), Image.LANCZOS)
+    elif bg_source:
+        head_bg = _fetch_image(bg_source).resize((width, head_h), Image.LANCZOS)
+    else:
+        head_bg = Image.new("RGB", (width, head_h), (30, 30, 60))
+    head_bg = _darken(head_bg, alpha=110)
+    canvas.paste(head_bg, (0, 0))
+
+    d = ImageDraw.Draw(canvas)
+    d.text((pad, int(head_h * 0.10)), "KUJIALE 酷家乐", font=f_brand, fill=(255, 255, 255))
+    y = int(head_h * 0.34)
+    y = _draw_wrapped(d, headline, f_head, pad, y, content_w, (255, 255, 255), line_gap=14)
+    y += 12
+    _draw_wrapped(d, subhead, f_sub, pad, y, content_w, (235, 235, 235), line_gap=10)
+
+    # 卖点板块
+    y = head_h + 40
+    for sec, ch in zip(sections, card_heights):
+        # 卡片底
+        d.rounded_rectangle([pad, y, width - pad, y + ch], radius=20, fill=CARD_BG)
+        # 左侧橙色竖条
+        d.rounded_rectangle([pad, y + card_pad, pad + 10, y + ch - card_pad], radius=5, fill=ORANGE)
+        tx = pad + card_pad + 20
+        ty = y + card_pad
+        d.text((tx, ty), sec.get("heading", ""), font=f_sec_h, fill=DARK)
+        ty += sec_head_h + 18
+        _draw_wrapped(d, sec.get("body", ""), f_sec_b, tx, ty, content_w - card_pad * 2 - 20, GRAY, line_gap=12)
+        y += ch + card_gap
+
+    # CTA 按钮（居中）
+    cta_text = cta
+    cta_bbox = d.textbbox((0, 0), cta_text, font=f_cta)
+    cta_w = cta_bbox[2] - cta_bbox[0]
+    cta_h = cta_bbox[3] - cta_bbox[1]
+    btn_w = cta_w + 120
+    btn_h = cta_h + 56
+    btn_x = (width - btn_w) // 2
+    btn_y = y + 30
+    d.rounded_rectangle([btn_x, btn_y, btn_x + btn_w, btn_y + btn_h], radius=btn_h // 2, fill=ORANGE)
+    d.text((btn_x + (btn_w - cta_w) // 2, btn_y + (btn_h - cta_h) // 2 - cta_bbox[1]), cta_text, font=f_cta, fill="white")
+
+    return canvas
 
 
 if __name__ == "__main__":
@@ -121,3 +338,18 @@ if __name__ == "__main__":
         out = f"test_{key}.jpg"
         img.save(out, quality=90)
         print(f"saved {out}  {img.size}")
+
+    # 详情页长图冒烟
+    detail_demo = {
+        "headline": "3分钟解锁异形门衣柜",
+        "subhead": "跟着酷家乐，从设计到出图一气呵成",
+        "sections": [
+            {"heading": "智能建模", "body": "拖拽即可生成异形门衣柜模型，无需手动建模，效率提升十倍。"},
+            {"heading": "实时渲染", "body": "所见即所得的渲染效果，灯光材质一键调节，方案立等可取。"},
+            {"heading": "海量素材", "body": "数百万家居素材库随取随用，覆盖各类风格与户型场景。"},
+        ],
+        "cta": "立即体验",
+    }
+    dp = make_detail_page("", detail_demo)
+    dp.save("test_detail.jpg", quality=90)
+    print(f"saved test_detail.jpg  {dp.size}")
