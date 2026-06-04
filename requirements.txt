@@ -4,3 +4,6 @@ pillow==10.3.0
 gradio==4.44.0
 openai==1.40.0
 python-dotenv==1.0.1
+yt-dlp==2026.3.17
+opencv-python-headless==4.13.0.92
+faster-whisper==1.2.1

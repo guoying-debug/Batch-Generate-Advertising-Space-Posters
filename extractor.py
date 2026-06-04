@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 从 B站链接 或 通用网页链接 提取：标题、简介、封面图URL、关键词
-升级：新增 full_text（完整正文）和 images（页面图片URL列表）
+升级：新增活动页专属字段、full_text（完整正文）和 images（页面图片URL列表）
 """
 import re
 import requests
@@ -11,6 +11,76 @@ from bs4 import BeautifulSoup
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"}
 MAX_TEXT = 4000   # 正文字符上限
 MAX_IMGS = 20     # 图片URL上限
+
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _pick_first(items: list) -> str:
+    for item in items:
+        item = _clean_text(item)
+        if item:
+            return item
+    return ""
+
+
+def _guess_cta_text(soup: BeautifulSoup) -> str:
+    candidates = []
+    for el in soup.find_all(["a", "button", "span", "div"]):
+        text = _clean_text(el.get_text(" ", strip=True))
+        if 2 <= len(text) <= 16 and any(k in text for k in ("立即", "马上", "领取", "报名", "查看", "了解", "参与", "预约", "点击", "体验")):
+            candidates.append(text)
+    return _pick_first(candidates)
+
+
+def _extract_benefits(full_text: str) -> list:
+    segments = []
+    for line in re.split(r"[\n。！？；]", full_text or ""):
+        line = _clean_text(line)
+        if 8 <= len(line) <= 40:
+            if any(k in line for k in ("免费", "福利", "优惠", "限时", "报名", "领取", "抽奖", "课程", "活动", "教程", "方案", "直播", "训练营", "体验", "升级")):
+                segments.append(line)
+    dedup = []
+    for seg in segments:
+        if seg not in dedup:
+            dedup.append(seg)
+    return dedup[:4]
+
+
+def _extract_event_time(full_text: str) -> str:
+    patterns = [
+        r"\d{4}[./-]\d{1,2}[./-]\d{1,2}\s*(?:至|-|到)\s*\d{4}[./-]\d{1,2}[./-]\d{1,2}",
+        r"\d{1,2}[./-]\d{1,2}\s*(?:至|-|到)\s*\d{1,2}[./-]\d{1,2}",
+        r"\d{4}年\d{1,2}月\d{1,2}日\s*(?:至|-|到)\s*\d{4}年?\d{1,2}月\d{1,2}日",
+        r"\d{1,2}月\d{1,2}日\s*(?:至|-|到)\s*\d{1,2}月\d{1,2}日",
+        r"(?:活动时间|报名时间|直播时间|截止时间)[:：]\s*([^\n]{4,30})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, full_text or "")
+        if not match:
+            continue
+        return _clean_text(match.group(1) if match.lastindex else match.group(0))
+    return ""
+
+
+def _extract_activity_fields(soup: BeautifulSoup, title: str, desc: str, full_text: str) -> dict:
+    headings = [_clean_text(el.get_text(" ", strip=True)) for el in soup.find_all(["h1", "h2", "h3"])]
+    headings = [h for h in headings if 2 <= len(h) <= 40]
+    paras = [_clean_text(el.get_text(" ", strip=True)) for el in soup.find_all(["p", "li"])]
+    paras = [p for p in paras if 8 <= len(p) <= 80]
+    main_title = _pick_first([title] + headings)
+    subtitle = _pick_first([desc] + paras[:6])
+    benefits = _extract_benefits("\n".join(paras) or full_text)
+    cta = _guess_cta_text(soup)
+    event_time = _extract_event_time(full_text)
+    return {
+        "main_title": main_title,
+        "sub_title": subtitle,
+        "benefits": benefits,
+        "cta_text": cta,
+        "event_time": event_time,
+    }
 
 
 def extract_bilibili(bvid: str) -> dict:
@@ -24,6 +94,13 @@ def extract_bilibili(bvid: str) -> dict:
         "keywords": [t["tag_name"] for t in data.get("tags", [])][:5],
         "full_text": data.get("desc", "").strip() or data["title"],
         "images": [data["pic"]],
+        "activity_fields": {
+            "main_title": data["title"],
+            "sub_title": data.get("desc", "").strip()[:60],
+            "benefits": [],
+            "cta_text": "",
+            "event_time": "",
+        },
     }
 
 
@@ -97,6 +174,7 @@ def extract_webpage(url: str) -> dict:
     images = _extract_images(soup, url)
     if cover and cover not in images:
         images.insert(0, cover)
+    activity_fields = _extract_activity_fields(soup, title, desc, full_text)
 
     return {
         "title": title,
@@ -105,6 +183,7 @@ def extract_webpage(url: str) -> dict:
         "keywords": keywords[:5],
         "full_text": full_text,
         "images": images,
+        "activity_fields": activity_fields,
     }
 
 

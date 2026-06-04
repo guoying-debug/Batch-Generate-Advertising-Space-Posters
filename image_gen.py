@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """模式一：调 Cogview-3-Flash 根据 image_prompt 生成背景图，返回 PIL Image"""
 import os, io, requests
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from openai import OpenAI
+
+
+def _enhance_generated(img: Image.Image) -> Image.Image:
+    img = ImageEnhance.Contrast(img).enhance(1.04)
+    img = ImageEnhance.Sharpness(img).enhance(1.08)
+    return img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=95, threshold=2))
 
 
 def generate_background(image_prompt: str, size: str = "1440x720") -> Image.Image:
@@ -22,7 +28,7 @@ def generate_background(image_prompt: str, size: str = "1440x720") -> Image.Imag
     )
     img_url = r.data[0].url
     resp = requests.get(img_url, timeout=30)
-    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    return _enhance_generated(Image.open(io.BytesIO(resp.content)).convert("RGB"))
 
 
 if __name__ == "__main__":
