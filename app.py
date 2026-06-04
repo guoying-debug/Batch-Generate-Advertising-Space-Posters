@@ -54,7 +54,20 @@ def _template_choices():
     return sorted(_load_templates().keys())
 
 
-def step_extract_and_write(url, operator_text, gallery_files):
+def _reference_info_text(reference_analysis: dict) -> str:
+    if not reference_analysis:
+        return "未上传参考图"
+    parts = [
+        f"风格摘要: {reference_analysis.get('summary', '')}",
+        f"版式: {reference_analysis.get('layout', '')}",
+        f"风格: {reference_analysis.get('style', '')}",
+        f"配色: {reference_analysis.get('color_palette', '')}",
+        f"主体: {reference_analysis.get('subject', '')}",
+    ]
+    return "\n".join([p for p in parts if p.strip().split(':', 1)[-1].strip()]) or "已读取参考图"
+
+
+def step_extract_and_write(url, operator_text, gallery_files, reference_files):
     """① 提取链接内容（含视频多帧+语音理解） + 生成文案"""
     if not url.strip():
         raise gr.Error("请输入链接")
@@ -83,6 +96,9 @@ def step_extract_and_write(url, operator_text, gallery_files):
         else:
             notes.append("视频下载失败或超限，已降级用封面+元数据")
 
+    reference_images = _load_gallery(reference_files)
+    reference_analysis = ai_writer.analyze_reference_images(reference_images)
+
     poster_goal = "教程推广" if _is_video(url) else "活动推广"
     poster_plan = ai_writer.generate_poster_plan(
         content,
@@ -92,6 +108,7 @@ def step_extract_and_write(url, operator_text, gallery_files):
         brand="KUJIALE",
         poster_goal=poster_goal,
         reference_style="现代家居教程海报，设计案例图片加文字，适合运营广告位",
+        reference_analysis=reference_analysis,
     )
     copy = ai_writer.normalize_plan_to_legacy_fields(poster_plan)
     detail = ai_writer.plan_to_detail(poster_plan, content, operator_text)
@@ -112,6 +129,7 @@ def step_extract_and_write(url, operator_text, gallery_files):
         f"海报类型: {poster_plan.get('poster_type','')}\n"
         f"主题摘要: {poster_plan.get('topic_summary','')}\n"
         f"模板ID: {visual.get('template_id','')}\n"
+        f"参考图风格摘要: {poster_plan.get('reference_style_summary', '')}\n"
         f"可替换槽位: {'、'.join(visual.get('replaceable_slots', [])[:5])}\n"
         f"固定元素: {'、'.join(visual.get('fixed_elements', [])[:4])}\n"
         f"活动标题: {activity_fields.get('main_title','')}\n"
@@ -130,6 +148,7 @@ def step_extract_and_write(url, operator_text, gallery_files):
         detail.get("image_prompt", copy.get("image_prompt", "")),
         copy.get("square_prompt", copy.get("image_prompt", "")),
         json.dumps(poster_plan, ensure_ascii=False, indent=2),
+        _reference_info_text(reference_analysis),
         "\n".join(activity_fields.get("benefits", [])),
         activity_fields.get("event_time", ""),
         activity_fields.get("cta_text", ""),
@@ -139,6 +158,7 @@ def step_extract_and_write(url, operator_text, gallery_files):
         ranked_candidates,             # candidates_state
         video_summary,                 # video_summary_state
         poster_plan,                   # poster_plan_state
+        reference_analysis,            # reference_analysis_state
         (_pick_note(ranked_candidates[0], "系统预选最高分") if ranked_candidates else "暂无可评分候选图"),
     )
 
@@ -262,6 +282,13 @@ def load_plan_template(template_name):
     compact = ai_writer.compact_copywriting(plan)
     detail = ai_writer.plan_to_detail(plan)
     event_info = plan.get("event_info", {})
+    reference_analysis = {
+        "summary": plan.get("reference_style_summary", ""),
+        "layout": ((plan.get("visual_strategy") or {}).get("composition", "")),
+        "style": ((plan.get("visual_strategy") or {}).get("style", "")),
+        "color_palette": ((plan.get("visual_strategy") or {}).get("color_palette", "")),
+        "subject": ((plan.get("visual_strategy") or {}).get("subject", "")),
+    }
     return (
         json.dumps(plan, ensure_ascii=False, indent=2),
         compact.get("title", ""),
@@ -270,12 +297,14 @@ def load_plan_template(template_name):
         legacy.get("image_prompt", ""),
         legacy.get("square_prompt", ""),
         legacy.get("detail_prompt", ""),
+        _reference_info_text(reference_analysis),
         "\n".join(event_info.get("benefits", [])),
         event_info.get("event_time", ""),
         compact.get("cta", "立即查看"),
         detail,
         f"已加载模板：{name}",
         plan,
+        reference_analysis,
     )
 
 
@@ -355,6 +384,7 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
     candidates_state = gr.State([])
     video_summary_state = gr.State("")
     poster_plan_state = gr.State({})
+    reference_analysis_state = gr.State({})
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -363,6 +393,8 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
             op_text = gr.Textbox(label="运营补充文案（可选）", placeholder="例：3分钟解锁异形门衣柜")
             gallery = gr.File(label="图片库（可选，多张，自动挑最贴合的）",
                               file_count="multiple", file_types=["image"])
+            reference_gallery = gr.File(label="参考图（可选，多张，用于学习版式和风格）",
+                                        file_count="multiple", file_types=["image"])
             extract_btn = gr.Button("① 读取链接 + 理解内容 + 生成文案", variant="primary")
             info_box = gr.Textbox(label="提取与理解结果", lines=5, interactive=False)
 
@@ -374,6 +406,7 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
             square_prompt_box = gr.Textbox(label="方图背景生图描述（模式一生效）", lines=2)
             detail_prompt_box = gr.Textbox(label="详情页背景生图描述（模式一生效，可改）", lines=3)
             plan_box = gr.Textbox(label="poster_plan（可审核和手改 JSON）", lines=18)
+            reference_box = gr.Textbox(label="参考图分析结果", lines=6, interactive=False)
             gr.Markdown("**活动页字段命中结果**")
             benefits_box = gr.Textbox(label="benefits", lines=4, interactive=False)
             event_time_box = gr.Textbox(label="event_time", interactive=False)
@@ -400,11 +433,11 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
 
     extract_btn.click(
         step_extract_and_write,
-        inputs=[url, op_text, gallery],
+        inputs=[url, op_text, gallery, reference_gallery],
         outputs=[cover_state, info_box, title_box, subtitle_box, cta_box,
-                 prompt_box, detail_state, detail_prompt_box, square_prompt_box, plan_box,
+                 prompt_box, detail_state, detail_prompt_box, square_prompt_box, plan_box, reference_box,
                  benefits_box, event_time_box, activity_cta_box,
-                 candidate_gallery, candidate_choice, rank_reason_box, candidates_state, video_summary_state, poster_plan_state,
+                 candidate_gallery, candidate_choice, rank_reason_box, candidates_state, video_summary_state, poster_plan_state, reference_analysis_state,
                  pick_box],
     )
     candidate_gallery.select(
@@ -421,8 +454,8 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
         load_plan_template,
         inputs=[template_dropdown],
         outputs=[plan_box, title_box, subtitle_box, cta_box, prompt_box, square_prompt_box,
-                 detail_prompt_box, benefits_box, event_time_box, activity_cta_box,
-                 detail_state, pick_box, poster_plan_state],
+                 detail_prompt_box, reference_box, benefits_box, event_time_box, activity_cta_box,
+                 detail_state, pick_box, poster_plan_state, reference_analysis_state],
     )
     make_btn.click(
         step_make,
