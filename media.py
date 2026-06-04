@@ -13,6 +13,7 @@ import re
 import base64
 import glob
 import tempfile
+import shutil
 
 import cv2
 from PIL import Image
@@ -24,6 +25,46 @@ ASR_CLIP_SEC = 180      # ASR 只转写前 3 分钟
 MAX_TRANSCRIPT = 2000   # 转写文本上限
 
 
+def _pick_best_format(formats: list, want_video: bool = False, want_audio: bool = False) -> dict | None:
+    candidates = []
+    for f in formats or []:
+        if want_video and f.get("vcodec") in (None, "none"):
+            continue
+        if want_audio and f.get("acodec") in (None, "none"):
+            continue
+        if not want_audio and f.get("acodec") not in (None, "none"):
+            pass
+        if f.get("protocol") and "m3u8" in str(f.get("protocol")):
+            continue
+        candidates.append(f)
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda x: (
+            x.get("height") or 0,
+            x.get("abr") or 0,
+            x.get("tbr") or 0,
+        ),
+        reverse=True,
+    )[0]
+
+
+def _download_single(ydl_opts: dict, url: str, format_selector: str, outtmpl: str) -> bool:
+    import yt_dlp
+
+    opts = dict(ydl_opts)
+    opts["format"] = format_selector
+    opts["outtmpl"] = outtmpl
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        return True
+    except Exception as e:
+        print(f"[media] 格式 {format_selector} 下载失败: {e}")
+        return False
+
+
 def download_video(url: str, tmp_dir: str = None) -> dict:
     """
     下载单文件视频流（progressive，含音轨，无需 ffmpeg 合并）+ 尝试下字幕。
@@ -33,12 +74,10 @@ def download_video(url: str, tmp_dir: str = None) -> dict:
     import yt_dlp
 
     tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="kjl_media_")
-    out_tmpl = os.path.join(tmp_dir, "video.%(ext)s")
+    video_tmpl = os.path.join(tmp_dir, "video.%(ext)s")
+    audio_tmpl = os.path.join(tmp_dir, "audio.%(ext)s")
 
-    # 优先选 best 且音视频合一的格式（[acodec!=none][vcodec!=none]），避免分离流要合并
     ydl_opts = {
-        "format": "best[acodec!=none][vcodec!=none]/best",
-        "outtmpl": out_tmpl,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -71,19 +110,49 @@ def download_video(url: str, tmp_dir: str = None) -> dict:
             duration = info.get("duration") or 0
             if duration and duration > MAX_DURATION:
                 print(f"[media] 视频时长 {duration}s 超限，跳过下载")
-                return {"video": None, "subtitle": None, "duration": duration}
-            ydl.download([url])
+                return {"video": None, "audio": None, "subtitle": None, "duration": duration}
+            formats = info.get("formats") or []
+
+            progressive = [
+                f for f in formats
+                if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
+            ]
+            downloaded = False
+            if progressive:
+                prog = _pick_best_format(progressive, want_video=True, want_audio=True)
+                if prog and prog.get("format_id"):
+                    downloaded = _download_single(ydl_opts, url, prog["format_id"], video_tmpl)
+
+            if not downloaded:
+                video_fmt = _pick_best_format(formats, want_video=True, want_audio=False)
+                if video_fmt and video_fmt.get("format_id"):
+                    downloaded = _download_single(ydl_opts, url, video_fmt["format_id"], video_tmpl)
+                audio_fmt = _pick_best_format(
+                    [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")],
+                    want_audio=True,
+                )
+                if audio_fmt and audio_fmt.get("format_id"):
+                    _download_single(ydl_opts, url, audio_fmt["format_id"], audio_tmpl)
+
+            if not downloaded:
+                raise RuntimeError("未找到可下载的视频格式")
     except Exception as e:
         print(f"[media] 视频下载失败: {e}")
-        return {"video": None, "subtitle": None, "duration": 0}
+        return {"video": None, "audio": None, "subtitle": None, "duration": 0}
 
     videos = [f for f in glob.glob(os.path.join(tmp_dir, "video.*"))
               if not f.endswith((".vtt", ".srt"))]
+    audios = [f for f in glob.glob(os.path.join(tmp_dir, "audio.*"))
+              if not f.endswith((".vtt", ".srt"))]
     subs = glob.glob(os.path.join(tmp_dir, "video.*.vtt")) + \
         glob.glob(os.path.join(tmp_dir, "video.*.srt"))
+    if not subs:
+        subs = glob.glob(os.path.join(tmp_dir, "audio.*.vtt")) + \
+            glob.glob(os.path.join(tmp_dir, "audio.*.srt"))
 
     return {
         "video": videos[0] if videos else None,
+        "audio": audios[0] if audios else None,
         "subtitle": subs[0] if subs else None,
         "duration": duration,
     }
@@ -176,8 +245,10 @@ def get_transcript(media: dict) -> str:
             return text
 
     # 2) ASR 转写
+    audio = media.get("audio")
     video = media.get("video")
-    if not video or not os.path.exists(video):
+    asr_source = audio if audio and os.path.exists(audio) else video
+    if not asr_source or not os.path.exists(asr_source):
         return ""
     try:
         from faster_whisper import WhisperModel
@@ -187,7 +258,7 @@ def get_transcript(media: dict) -> str:
             compute_type="int8",
         )
         segments, _ = model.transcribe(
-            video,
+            asr_source,
             language=None,            # 自动检测中英
             clip_timestamps=f"0,{ASR_CLIP_SEC}",
             vad_filter=True,
