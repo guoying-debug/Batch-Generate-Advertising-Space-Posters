@@ -144,9 +144,12 @@ def step_extract_and_write(url, operator_text, gallery_files, reference_files):
         copy["subtitle"],
         copy["cta"],
         copy.get("image_prompt", ""),
+        copy.get("image_render_prompt", copy.get("image_prompt", "")),
         detail,
         detail.get("image_prompt", copy.get("image_prompt", "")),
+        copy.get("detail_render_prompt", detail.get("image_prompt", copy.get("image_prompt", ""))),
         copy.get("square_prompt", copy.get("image_prompt", "")),
+        copy.get("square_render_prompt", copy.get("square_prompt", copy.get("image_prompt", ""))),
         json.dumps(poster_plan, ensure_ascii=False, indent=2),
         _reference_info_text(reference_analysis),
         "\n".join(activity_fields.get("benefits", [])),
@@ -295,8 +298,11 @@ def load_plan_template(template_name):
         compact.get("subtitle", ""),
         compact.get("cta", "立即查看"),
         legacy.get("image_prompt", ""),
+        legacy.get("image_render_prompt", legacy.get("image_prompt", "")),
         legacy.get("square_prompt", ""),
+        legacy.get("square_render_prompt", legacy.get("square_prompt", "")),
         legacy.get("detail_prompt", ""),
+        legacy.get("detail_render_prompt", legacy.get("detail_prompt", "")),
         _reference_info_text(reference_analysis),
         "\n".join(event_info.get("benefits", [])),
         event_info.get("event_time", ""),
@@ -308,8 +314,8 @@ def load_plan_template(template_name):
     )
 
 
-def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt,
-              square_prompt, detail_state, detail_prompt, candidates_state, gallery_files,
+def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, image_render_prompt,
+              square_prompt, square_render_prompt, detail_state, detail_prompt, detail_render_prompt, candidates_state, gallery_files,
               candidate_choice, poster_plan_text, poster_plan_state):
     """③ 合成 banner + 方图 + 详情页长图（模式二自动挑图）"""
     detail = detail_state or {}
@@ -317,8 +323,11 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt,
     plan = _parse_plan_text(poster_plan_text, poster_plan_state)
     legacy = ai_writer.normalize_plan_to_legacy_fields(plan)
     banner_prompt = image_prompt.strip() or legacy.get("image_prompt", "")
+    banner_render_prompt = image_render_prompt.strip() or legacy.get("image_render_prompt", banner_prompt)
     square_prompt = square_prompt.strip() or legacy.get("square_prompt", banner_prompt)
+    square_render_prompt = square_render_prompt.strip() or legacy.get("square_render_prompt", square_prompt or banner_render_prompt)
     detail_prompt = detail_prompt.strip() or legacy.get("detail_prompt", square_prompt)
+    detail_render_prompt = detail_render_prompt.strip() or legacy.get("detail_render_prompt", detail_prompt or square_render_prompt)
     visual = plan.get("visual_strategy", {})
     ranked_candidates = candidates_state or []
 
@@ -329,11 +338,11 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt,
             square_bg = upload_img
             pick_note = "来源:手动上传 | 分数:人工指定 | 选择结果:使用上传图生成"
         else:
-            if not banner_prompt:
+            if not banner_render_prompt:
                 raise gr.Error("模式一需要生图描述，请先点①生成或手动填写")
-            banner_bg = image_gen.generate_background(banner_prompt, size="1440x720")
-            square_bg = image_gen.generate_background(square_prompt or banner_prompt, size="1024x1024")
-            pick_note = "来源:AI生图提示词 | 分数:不适用 | 选择结果:使用AI生成背景"
+            banner_bg = image_gen.generate_background(banner_render_prompt, size="1440x720")
+            square_bg = image_gen.generate_background(square_render_prompt or banner_render_prompt, size="1024x1024")
+            pick_note = "来源:AI安全生图提示词 | 分数:不适用 | 选择结果:使用AI生成背景"
     else:
         # 模式二：图库优先 → 候选池，按主题自动挑最佳
         if upload_img is not None:
@@ -357,8 +366,8 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt,
             pick_note = _pick_note(chosen, selection_mode)
 
     # 详情页头图背景
-    if mode == MODE1 and detail_prompt and detail_prompt.strip():
-        detail_bg = image_gen.generate_background(detail_prompt.strip(), size="1440x720")
+    if mode == MODE1 and detail_render_prompt and detail_render_prompt.strip():
+        detail_bg = image_gen.generate_background(detail_render_prompt.strip(), size="1440x720")
     else:
         detail_bg = banner_bg
 
@@ -402,9 +411,12 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
             title_box    = gr.Textbox(label="主标题（Banner/方图用）")
             subtitle_box = gr.Textbox(label="副标题文案")
             cta_box      = gr.Textbox(label="行动号召")
-            prompt_box   = gr.Textbox(label="Banner背景生图描述（模式一生效）", lines=2)
-            square_prompt_box = gr.Textbox(label="方图背景生图描述（模式一生效）", lines=2)
-            detail_prompt_box = gr.Textbox(label="详情页背景生图描述（模式一生效，可改）", lines=3)
+            prompt_box   = gr.Textbox(label="Banner海报策划提示词（审核用）", lines=2)
+            render_prompt_box = gr.Textbox(label="Banner安全生图提示词（模式一实际使用）", lines=2)
+            square_prompt_box = gr.Textbox(label="方图海报策划提示词（审核用）", lines=2)
+            square_render_prompt_box = gr.Textbox(label="方图安全生图提示词（模式一实际使用）", lines=2)
+            detail_prompt_box = gr.Textbox(label="详情页海报策划提示词（审核用）", lines=3)
+            detail_render_prompt_box = gr.Textbox(label="详情页安全生图提示词（模式一实际使用）", lines=3)
             plan_box = gr.Textbox(label="poster_plan（可审核和手改 JSON）", lines=18)
             reference_box = gr.Textbox(label="参考图分析结果", lines=6, interactive=False)
             gr.Markdown("**活动页字段命中结果**")
@@ -435,7 +447,7 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
         step_extract_and_write,
         inputs=[url, op_text, gallery, reference_gallery],
         outputs=[cover_state, info_box, title_box, subtitle_box, cta_box,
-                 prompt_box, detail_state, detail_prompt_box, square_prompt_box, plan_box, reference_box,
+                 prompt_box, render_prompt_box, detail_state, detail_prompt_box, detail_render_prompt_box, square_prompt_box, square_render_prompt_box, plan_box, reference_box,
                  benefits_box, event_time_box, activity_cta_box,
                  candidate_gallery, candidate_choice, rank_reason_box, candidates_state, video_summary_state, poster_plan_state, reference_analysis_state,
                  pick_box],
@@ -453,14 +465,14 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
     load_template_btn.click(
         load_plan_template,
         inputs=[template_dropdown],
-        outputs=[plan_box, title_box, subtitle_box, cta_box, prompt_box, square_prompt_box,
-                 detail_prompt_box, reference_box, benefits_box, event_time_box, activity_cta_box,
+        outputs=[plan_box, title_box, subtitle_box, cta_box, prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box,
+                 detail_prompt_box, detail_render_prompt_box, reference_box, benefits_box, event_time_box, activity_cta_box,
                  detail_state, pick_box, poster_plan_state, reference_analysis_state],
     )
     make_btn.click(
         step_make,
         inputs=[cover_state, title_box, subtitle_box, cta_box, mode, upload_img,
-                prompt_box, square_prompt_box, detail_state, detail_prompt_box,
+                prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box, detail_state, detail_prompt_box, detail_render_prompt_box,
                 candidates_state, gallery, candidate_choice, plan_box, poster_plan_state],
         outputs=[banner_out, square_out, detail_out, pick_box],
     )
