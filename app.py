@@ -341,18 +341,29 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
     visual = plan.get("visual_strategy", {})
     ranked_candidates = candidates_state or []
 
+    used_ai_gen = False
+
     if mode == MODE1:
-        # AI 生图（运营手动上传单图优先）
+        # 智能背景：手动图优先 → 候选图库 → AI 生图兜底
         if upload_img is not None:
             banner_bg = upload_img
             square_bg = upload_img
             pick_note = "来源:手动上传 | 分数:人工指定 | 选择结果:使用上传图生成"
         else:
-            if not banner_render_prompt:
-                raise gr.Error("模式一需要生图描述，请先点①生成或手动填写")
-            banner_bg = image_gen.generate_background(banner_render_prompt, size="1440x720")
-            square_bg = image_gen.generate_background(square_render_prompt or banner_render_prompt, size="1024x1024")
-            pick_note = "来源:AI安全生图提示词 | 分数:不适用 | 选择结果:使用AI生成背景"
+            selected = next((c for c in ranked_candidates if c.get("choice_label") == candidate_choice), None)
+            chosen = selected or (ranked_candidates[0] if ranked_candidates else None)
+            if chosen is not None:
+                banner_bg = chosen["item"]
+                square_bg = chosen["item"]
+                selection_mode = "手动点选使用" if selected else "系统预选最高分（智能背景）"
+                pick_note = _pick_note(chosen, selection_mode)
+            else:
+                if not banner_render_prompt:
+                    raise gr.Error("没有可用候选图，且缺少生图描述。请先点①生成、上传图片库或手动填写生图提示词")
+                banner_bg = image_gen.generate_background(banner_render_prompt, size="1440x720")
+                square_bg = image_gen.generate_background(square_render_prompt or banner_render_prompt, size="1024x1024")
+                used_ai_gen = True
+                pick_note = "来源:AI安全生图提示词 | 分数:不适用 | 选择结果:无候选图，使用AI生成背景"
     else:
         # 模式二：图库优先 → 候选池，按主题自动挑最佳
         if upload_img is not None:
@@ -375,8 +386,8 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
             selection_mode = "手动点选使用" if selected else "系统自动使用最高分"
             pick_note = _pick_note(chosen, selection_mode)
 
-    # 详情页头图背景
-    if mode == MODE1 and detail_render_prompt and detail_render_prompt.strip():
+    # 详情页头图背景：只有真正用了AI生图时才再生成一张
+    if used_ai_gen and detail_render_prompt and detail_render_prompt.strip():
         detail_bg = image_gen.generate_background(detail_render_prompt.strip(), size="1440x720")
     else:
         detail_bg = banner_bg
@@ -391,7 +402,7 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
 
 def on_mode_change(mode):
     if mode == MODE1:
-        return gr.update(label="手动替换背景图（可选，留空则用AI生图）")
+        return gr.update(label="手动指定背景图（可选，留空则智能挑图，无候选才AI生图）")
     return gr.update(label="手动指定背景图（可选，留空则从图库/候选自动挑选）")
 
 
