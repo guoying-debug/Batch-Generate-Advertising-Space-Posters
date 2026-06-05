@@ -114,10 +114,11 @@ def _pil_to_data_url(img: Image.Image, max_side: int = 1280) -> str:
 
 
 def analyze_reference_images(images: list) -> dict:
-    """读取参考图，提炼版式、风格、色彩和可复用元素"""
+    """读取参考图，提炼版式、风格、色彩和动态布局结构。"""
     valid = [im for im in (images or []) if isinstance(im, Image.Image)]
     if not valid:
         return {}
+
     content = [{
         "type": "text",
         "text": (
@@ -147,6 +148,8 @@ def analyze_reference_images(images: list) -> dict:
     }]
     for img in valid[:4]:
         content.append({"type": "image_url", "image_url": {"url": _pil_to_data_url(img)}})
+
+    style_data = {}
     try:
         r = _client().chat.completions.create(
             model=os.getenv("VISION_MODEL", "glm-4v-flash"),
@@ -155,7 +158,7 @@ def analyze_reference_images(images: list) -> dict:
             max_tokens=600,
         )
         data = _safe_json_loads(r.choices[0].message.content)
-        return {
+        style_data = {
             "summary": data.get("summary", ""),
             "layout": data.get("layout", ""),
             "style": data.get("style", ""),
@@ -178,8 +181,25 @@ def analyze_reference_images(images: list) -> dict:
             "theme": data.get("theme") or {},
         }
     except Exception as e:
-        print(f"[ai_writer] 参考图分析失败: {e}")
-        return {}
+        print(f"[ai_writer] AI 风格分析失败: {e}")
+
+    layout_specs = {}
+    try:
+        import layout_analyzer
+
+        banner_spec = layout_analyzer.analyze_layout(valid[0], target_size=(2560, 320))
+        layout_specs["banner"] = banner_spec
+        layout_specs["square"] = layout_analyzer.derive_layout(banner_spec, (1160, 1016))
+        layout_specs["detail"] = layout_analyzer.derive_layout(banner_spec, (1080, 1440))
+        print(f"[ai_writer] 布局分析完成，置信度: {banner_spec.get('confidence', 0):.2f}")
+    except Exception as e:
+        print(f"[ai_writer] 布局分析失败，回退到 AI 版式: {e}")
+
+    return {
+        **style_data,
+        "layout_specs": layout_specs,
+    }
+
 
 
 def _safe_json_loads(text: str) -> dict:

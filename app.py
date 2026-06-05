@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-import json
 import os
+os.environ['FLAGS_use_mkldnn'] = '0'  # 必须在 paddle 导入前设置，禁用 oneDNN
+import json
 import re
 import gradio as gr
 from dotenv import load_dotenv
@@ -116,6 +117,9 @@ def step_extract_and_write(url, operator_text, gallery_files, reference_files):
         reference_style="若上传参考图，则参考图决定海报的版式、配色、视觉语言和装饰节奏；若未上传，则按内容自动规划。",
         reference_analysis=reference_analysis,
     )
+    # 把 reference_analysis（含 layout_specs）存入 plan，供 poster_maker 动态排版读取
+    if reference_analysis:
+        poster_plan["reference_analysis"] = reference_analysis
     copy = ai_writer.normalize_plan_to_legacy_fields(poster_plan)
     detail = ai_writer.plan_to_detail(poster_plan, content, operator_text)
 
@@ -249,26 +253,37 @@ def _pick_note(cand, selection_mode: str):
     )
 
 
-def _generate_mode1_background(render_prompt: str, source_img, text_size: str, image_size: str = "2K"):
+def _generate_mode1_background(render_prompt: str, source_img, text_size: str, image_size: str = "2K", plan: dict = None, size_key: str = None):
     prompt = (render_prompt or "").strip()
+
+    # 从 plan 提取 layout_zones（文字安全区约束）
+    layout_zones = None
+    if plan and size_key:
+        ref_analysis = (plan or {}).get("reference_analysis") or {}
+        layout_specs = ref_analysis.get("layout_specs") or {}
+        spec = layout_specs.get(size_key) or {}
+        if spec.get("confidence", 0) >= 0.5:
+            layout_zones = spec.get("layout_zones") or []
+            if layout_zones:
+                print(f"[app] 模式一生图将注入 {len(layout_zones)} 个文字安全区约束（{size_key}）")
+
     if source_img is not None:
         try:
-            return image_gen.generate_background_img2img(prompt, source_img, size=image_size), "图生图"
+            return image_gen.generate_background_img2img(prompt, source_img, size=image_size, layout_zones=layout_zones), "图生图"
         except Exception as e:
             print(f"[app] 图生图失败，准备回退: {e}")
             if prompt:
                 try:
-                    return image_gen.generate_background(prompt, size=text_size), "图生图失败，已回退文生图"
+                    return image_gen.generate_background(prompt, size=text_size, layout_zones=layout_zones), "图生图失败，已回退文生图"
                 except Exception as fallback_e:
                     print(f"[app] 文生图回退失败，直接使用原图: {fallback_e}")
             return source_img, "图生图失败，已直接使用原图"
     if not prompt:
         raise gr.Error("缺少生图提示词，无法执行模式一。请先点①生成内容或手动填写安全生图提示词")
     try:
-        return image_gen.generate_background(prompt, size=text_size), "文生图"
+        return image_gen.generate_background(prompt, size=text_size, layout_zones=layout_zones), "文生图"
     except Exception as e:
         raise gr.Error(f"模式一背景生成失败：{e}") from e
-
 
 def _parse_plan_text(plan_text, poster_plan_state):
     if plan_text and str(plan_text).strip():
@@ -347,7 +362,7 @@ def load_plan_template(template_name):
 
 def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, image_render_prompt,
               square_prompt, square_render_prompt, detail_state, detail_prompt, detail_render_prompt, candidates_state, gallery_files,
-              candidate_choice, poster_plan_text, poster_plan_state):
+              candidate_choice, poster_plan_text, poster_plan_state, layout_engine="固定模板（换图换字，复刻参考图版式结构）"):
     """③ 合成 banner + 方图 + 详情页长图"""
     detail = detail_state or {}
     pick_note = ""
@@ -369,8 +384,8 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
         # 智能生成：有图优先图生图，无图再文生图
         if upload_img is not None:
             generation_source = upload_img
-            banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, generation_source, text_size="1440x720")
-            square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, generation_source, text_size="1024x1024")
+            banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, generation_source, text_size="1440x720", plan=plan, size_key="banner")
+            square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, generation_source, text_size="1024x1024", plan=plan, size_key="square")
             used_ai_gen = banner_method != "图生图失败，已直接使用原图" or square_method != "图生图失败，已直接使用原图"
             pick_note = (
                 "来源:手动上传 | 分数:人工指定 | "
@@ -387,8 +402,8 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
                 selection_mode = "手动点选使用" if selected else "系统预选最高分（智能背景）"
                 pick_note = f"{_pick_note(chosen, selection_mode)} | Banner:{banner_method} | 方图:{square_method}"
             else:
-                banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, None, text_size="1440x720")
-                square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, None, text_size="1024x1024")
+                banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, None, text_size="1440x720", plan=plan, size_key="banner")
+                square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, None, text_size="1024x1024", plan=plan, size_key="square")
                 used_ai_gen = True
                 pick_note = (
                     "来源:AI安全生图提示词 | 分数:不适用 | "
@@ -423,6 +438,7 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
                 detail_render_prompt.strip(),
                 generation_source if mode == MODE1 else None,
                 text_size="1440x720",
+                plan=plan, size_key="detail",
             )
             if mode == MODE1:
                 pick_note = f"{pick_note} | 详情页:{detail_method}"
@@ -434,9 +450,12 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
     else:
         detail_bg = banner_bg
 
+    # 模式1和模式2统一使用文字叠加版式
+    # layout_engine 含「动态」时走 layout_specs 坐标贴合，否则走 template_id 固定模板
+    use_dynamic = "动态" in (layout_engine or "")
     return (
-        poster_maker.make_poster_any(banner_bg, title, subtitle, cta, "banner", plan),
-        poster_maker.make_poster_any(square_bg, title, subtitle, cta, "square", plan),
+        poster_maker.make_poster_any(banner_bg, title, subtitle, cta, "banner", plan, use_dynamic=use_dynamic),
+        poster_maker.make_poster_any(square_bg, title, subtitle, cta, "square", plan, use_dynamic=use_dynamic),
         poster_maker.make_detail_page(detail_bg, detail, plan=plan),
         pick_note or "合成完成",
     )
@@ -588,6 +607,11 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             mode = gr.Radio([MODE1, MODE2], value=MODE2, label="生成模式")
+            layout_engine = gr.Radio(
+                ["固定模板（换图换字，复刻参考图版式结构）", "动态贴合（图铺满背景，文字按参考图坐标叠加）"],
+                value="固定模板（换图换字，复刻参考图版式结构）",
+                label="排版引擎（参考图驱动时生效）",
+            )
             url = gr.Textbox(label="链接（B站视频/酷家乐活动页/网页）", placeholder="https://...")
             op_text = gr.Textbox(label="运营补充文案（可选）", placeholder="例：3分钟解锁异形门衣柜")
             gallery = gr.File(label="图片库（可选，多张，自动挑最贴合的）",
@@ -693,7 +717,7 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
         step_make,
         inputs=[cover_state, title_box, subtitle_box, cta_box, mode, upload_img,
                 prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box, detail_state, detail_prompt_box, detail_render_prompt_box,
-                candidates_state, gallery, candidate_choice, plan_box, poster_plan_state],
+                candidates_state, gallery, candidate_choice, plan_box, poster_plan_state, layout_engine],
         outputs=[banner_out, square_out, detail_out, pick_box],
     )
     compare_btn.click(

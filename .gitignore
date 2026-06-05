@@ -33,6 +33,8 @@ temp_q.docx
 cookies.txt
 示例图
 
-debug-doubao-connection-reset.md
+debug-*.md
 .dbg/
 debug-image-proxy-config.md
+tmp_doubao_test.py
+.claude\plans/

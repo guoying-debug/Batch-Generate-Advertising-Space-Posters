@@ -24,8 +24,13 @@
 
 - 视觉模型（GLM-4V-Flash）一次性理解多帧画面，输出视频内容/风格描述
 - 封面图语义描述，补充文案生成语境
-- **参考图驱动设计**：上传参考海报，AI 自动识别模板 ID、版式签名、视觉语言、配色方案，并强制应用到新海报的版式与装饰节奏
-- 生成结构化 `poster_plan`，包含：主题摘要、海报类型、目标人群、核心卖点、文案（主标题/副标题/CTA/角标）、视觉策略（`template_id` / `banner_layout_mode` / `square_layout_mode` / `style_strength` / `decoration_density` / `overlay_strength`）、分尺寸提示词
+- **参考图驱动设计（核心架构升级）**：
+  - **AI 风格分析**：识别参考图的模板 ID、版式签名、视觉语言、配色方案
+  - **OCR 布局提取（PaddleOCR）**：精确识别参考图中文字区域坐标、字号、颜色、对齐方式，生成结构化 `layout_spec` JSON
+  - **动态排版引擎**：按 `layout_spec` 的 `layout_zones` 把运营文案精准放入参考图的对应位置，无需手动调整
+  - **自动尺寸推导**：从 Banner 参考图自动推导出方图和详情页的布局规范（横向 → 纵向版式转换）
+  - **置信度机制**：OCR 识别置信度 < 0.5 时自动回退到固定模板系统，保证鲁棒性
+- 生成结构化 `poster_plan`，包含：主题摘要、海报类型、目标人群、核心卖点、文案（主标题/副标题/CTA/角标）、视觉策略（`template_id` / `banner_layout_mode` / `square_layout_mode` / `style_strength` / `decoration_density` / `overlay_strength`）、分尺寸提示词、**layout_specs**（含 banner/square/detail 三种尺寸的坐标规范）
 - 支持按主题从候选图池自动挑图（视觉模型打分，0-100），返回 TopN 排序理由
 - **文字设计规范**（防止生图出现乱码/多余文字）：
   - 画面文字用引号包裹，防止模型自由发挥生成乱码
@@ -41,13 +46,14 @@
 
 流程：
 
-- 有输入图时：输入链接 → 理解内容 → 生成文案和分尺寸提示词 → **Doubao Seedream 图生图** → 合成海报
-- 无输入图时：输入链接 → 理解内容 → 生成文案和分尺寸提示词 → **Cogview-3-Flash 文生图** → 合成海报
+- 有输入图时：输入链接 → 理解内容 → 生成文案和分尺寸提示词 → **代理接口图生图**（`chat/completions` 格式）→ 合成海报
+- 无输入图时：输入链接 → 理解内容 → 生成文案和分尺寸提示词 → **代理接口文生图**（`images/generations` 格式）→ 合成海报
 
 - 输入图来源以运营手动上传图为主；未上传时自动从候选图池中取最高分图，再无候选则直接文生图
 - Banner（2560×320）和方图（1160×1016）分别按各自提示词生成
 - 图生图失败时自动回退到文生图；若文生图也失败，则直接复用原图继续合成，避免流程中断
 - 详情页头图背景同步生成，失败时自动复用 Banner 背景
+- 支持异步任务模式（`IMAGE_PROXY_ASYNC=true`），自动轮询直到生图完成
 
 #### 模式二：复用封面 / 素材图（背景 + 文字形式）
 
@@ -117,26 +123,22 @@ pip install -r requirements.txt
 
 ```env
 ZHIPUAI_API_KEY=your_key_here
-# 可选覆盖默认值
+# 可选覆盖默认值（文本/视觉模型仍走智谱）
 ZHIPUAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 TEXT_MODEL=glm-4-flash-250414
 VISION_MODEL=glm-4v-flash
-IMAGE_MODEL=cogview-3-flash
 
-# 模式一图生图（代理接口，兼容 OpenAI images/generations 或 chat/completions 格式）
+# 模式一生图（文生图 + 图生图统一走代理接口，兼容 OpenAI images/generations 或 chat/completions 格式）
 IMAGE_PROXY_BASE_URL=https://your-proxy/v1/images/generations
 IMAGE_PROXY_API_KEY=your_proxy_key_here
 IMAGE_PROXY_MODEL=your-model-name          # 默认 nano-banana-pro
 IMAGE_PROXY_IMG2IMG_URL=                   # 可选，图生图单独接口；缺省用 /v1/chat/completions
+IMAGE_PROXY_STATUS_URL_TEMPLATE=           # 可选，异步任务查询地址模板，含 {task_id}
 IMAGE_PROXY_ASYNC=false                    # 异步模式：true 时开启任务轮询
 IMAGE_PROXY_POLL_INTERVAL=2                # 轮询间隔（秒）
 IMAGE_PROXY_POLL_TIMEOUT=180              # 最长等待（秒）
 
 ASR_MODEL=tiny
-
-# B站视频下载 cookie（遇到412风控时配置其中一项）
-# YTDLP_COOKIES_FROM_BROWSER=chrome   # 浏览器：chrome / edge / firefox
-# YTDLP_COOKIES_FILE=cookies.txt      # 或导出的 cookies.txt 文件
 ```
 
 ### 启动
@@ -183,8 +185,9 @@ python app.py
 ├── app.py              # Gradio UI 与主流程编排
 ├── extractor.py        # 链接内容提取（B站API + 通用网页）
 ├── ai_writer.py        # 文案生成、海报策划、图片打分挑选、参考图风格分析
+├── layout_analyzer.py  # 参考图 OCR 布局提取，生成结构化 layout_spec，并推导各尺寸版式
 ├── image_gen.py        # 模式一：代理接口文生图 + 图生图（含异步轮询）
-├── poster_maker.py     # 海报合成排版（Banner / 方图 / 详情页）
+├── poster_maker.py     # 海报合成排版（Banner / 方图 / 详情页，含动态排版引擎）
 ├── media.py            # 视频下载、抽帧、语音转写
 ├── requirements.txt
 └── .env                # API密钥（不入库）

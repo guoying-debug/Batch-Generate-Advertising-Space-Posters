@@ -18,12 +18,14 @@ def _enhance_generated(img: Image.Image) -> Image.Image:
     return img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=95, threshold=2))
 
 
-def _sanitize_prompt_for_image_model(prompt: str) -> str:
+def _sanitize_prompt_for_image_model(prompt: str, layout_zones: list = None) -> str:
+    """清洗提示词 + 注入文字安全区约束
+    layout_zones: 从 layout_spec 传入的文字/按钮区域列表
+    """
     prompt = (prompt or "").strip()
     if not prompt:
         prompt = "现代家居室内场景，柔和自然光，简洁大气"
 
-    # 删除会诱导模型在背景里画文字的词汇
     banned_words = [
         "标题", "主标题", "副标题", "文案", "文字", "按钮", "logo", "LOGO",
         "KUJIALE", "酷家乐", "平台", "立即体验", "立即查看", "广告语", "标语",
@@ -32,15 +34,25 @@ def _sanitize_prompt_for_image_model(prompt: str) -> str:
     for word in banned_words:
         prompt = prompt.replace(word, "")
 
-    # 去掉负面约束句式（容易触发风控）
     prompt = re.sub(r"(不得|禁止|严禁|不要|无需)[^，。；\n]{0,20}", "", prompt)
-    prompt = re.sub(r"[\"“”‘’「」]+", "", prompt)
+    prompt = re.sub(r"[\"""\'\'「」]+", "", prompt)
     prompt = re.sub(r"\s+", " ", prompt).strip(" ，。；")
 
     safe_suffix = (
         " 纯背景视觉图，画面中不包含任何文字、字母、数字、水印、logo、"
         "招牌、按钮、UI界面或屏幕截图。构图干净留白，现代写实，高级质感。"
     )
+
+    # 有 layout_zones 时注入安全区位置约束
+    if layout_zones:
+        text_zones = [z for z in layout_zones if z.get("zone_type") in ("text", "button")]
+        hints = []
+        for z in text_zones[:3]:
+            b = z["bbox"]
+            hints.append(f"画面 {b[0]}-{b[2]} 横向区域保持简洁背景")
+        if hints:
+            safe_suffix += " " + "，".join(hints) + "。"
+
     compact = (prompt[:180] if len(prompt) > 180 else prompt).strip(" ，。；")
     return compact + safe_suffix
 
@@ -480,12 +492,13 @@ def _download_generated_image(image_ref: str) -> Image.Image:
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
 
-def generate_background(image_prompt: str, size: str = "1440x720") -> Image.Image:
+def generate_background(image_prompt: str, size: str = "1440x720", layout_zones: list = None) -> Image.Image:
     """
     image_prompt : ai_writer.generate() 返回的 image_prompt 字段
     size         : 兼容旧调用；内部会转换成代理接口的 aspect_ratio/size
+    layout_zones : 可选，文字安全区列表（来自 layout_spec）
     """
-    safe_prompt = _sanitize_prompt_for_image_model(image_prompt)
+    safe_prompt = _sanitize_prompt_for_image_model(image_prompt, layout_zones)
     try:
         image_ref = _request_proxy_image(safe_prompt, size=size)
     except Exception as e:
@@ -500,9 +513,9 @@ def generate_background(image_prompt: str, size: str = "1440x720") -> Image.Imag
     return _enhance_generated(_download_generated_image(image_ref))
 
 
-def generate_background_img2img(image_prompt: str, input_image, size: str = "2K") -> Image.Image:
+def generate_background_img2img(image_prompt: str, input_image, size: str = "2K", layout_zones: list = None) -> Image.Image:
     """使用代理图片接口图生图。input_image 支持 PIL.Image、URL、data URL。"""
-    safe_prompt = _sanitize_prompt_for_image_model(image_prompt)
+    safe_prompt = _sanitize_prompt_for_image_model(image_prompt, layout_zones)
     try:
         image_ref = _request_proxy_chat_img2img(safe_prompt, image=input_image, size=size)
     except Exception as e:

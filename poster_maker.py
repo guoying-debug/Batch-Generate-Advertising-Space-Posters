@@ -496,10 +496,107 @@ def make_poster(
     return _compose(bg, title, subtitle, cta, size_key, plan)
 
 
-def make_poster_any(bg_source, title, subtitle, cta, size_key="banner", plan: dict = None) -> Image.Image:
-    """bg_source 可以是 URL 字符串 或 PIL Image（运营上传图）"""
+
+# ── 参考图驱动动态排版 ──────────────────────────────────────────────────────
+
+def _get_layout_spec(plan: dict, size_key: str) -> dict:
+    """从 plan 里取对应尺寸的 layout_spec；置信度 < 0.5 时返回空"""
+    ref = ((plan or {}).get("reference_analysis") or {})
+    specs = ref.get("layout_specs") or {}
+    spec = specs.get(size_key) or {}
+    if spec.get("confidence", 0) < 0.5:
+        return {}
+    return spec
+
+
+def _draw_zone_text(draw: ImageDraw.ImageDraw, text: str, zone: dict, canvas_size: tuple):
+    """在指定 zone bbox 内自适应字号绘制文字"""
+    x1, y1, x2, y2 = zone["bbox"]
+    max_w = max(x2 - x1, 1)
+    max_h = max(y2 - y1, 1)
+
+    fsize_range = zone.get("font_size_range") or [24, 72]
+    font = _fit_font_size(text, fsize_range[1], fsize_range[0], max_w, draw)
+
+    color_hex = zone.get("text_color") or "#FFFFFF"
+    try:
+        color = tuple(int(color_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+    except Exception:
+        color = (255, 255, 255)
+
+    # 确保文字不超出 bbox（换行后最多填满高度）
+    wrapped = _wrap_by_width(text, font, max_w, draw)
+    line_h = sum(font.getmetrics()) + 4
+    y = y1
+    for line in wrapped:
+        if y + line_h > y2 + line_h:  # 超出区域就截断
+            break
+        draw.text((x1, y), line, font=font, fill=color)
+        y += line_h
+
+
+def _draw_zone_button(draw: ImageDraw.ImageDraw, text: str, zone: dict, theme: dict):
+    """在 zone bbox 绘制圆角按钮"""
+    x1, y1, x2, y2 = zone["bbox"]
+    btn_color = theme.get("accent") or (255, 140, 0)
+    text_color = _ideal_text_on(btn_color)
+    draw.rounded_rectangle([x1, y1, x2, y2], radius=(y2 - y1) // 2, fill=btn_color)
+    font = _fit_font_size(text, zone.get("font_size_range", [24, 48])[1],
+                          zone.get("font_size_range", [24, 48])[0], x2 - x1 - 24, draw)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tx = x1 + ((x2 - x1) - (bbox[2] - bbox[0])) // 2
+    ty = y1 + ((y2 - y1) - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    draw.text((tx, ty), text, font=font, fill=text_color)
+
+
+def make_poster_dynamic(bg_source, title: str, subtitle: str, cta: str,
+                        layout_spec: dict, plan: dict = None) -> Image.Image:
+    """
+    参考图驱动排版：背景图作为完整底图，只叠加运营文案到 OCR 识别的坐标位置。
+    图生图负责生成保留参考图版式结构的背景，poster_maker 只替换文字。
+    """
+    canvas_w = layout_spec["canvas"]["width"]
+    canvas_h = layout_spec["canvas"]["height"]
+    theme = _resolve_theme(plan)
+
     if isinstance(bg_source, Image.Image):
-        w, h = SIZES[size_key]
+        canvas = _prepare_background(bg_source.convert("RGB"), (canvas_w, canvas_h))
+    else:
+        canvas = _prepare_background(_fetch_image(bg_source), (canvas_w, canvas_h))
+
+    draw = ImageDraw.Draw(canvas)
+
+    used = {"title": False, "subtitle": False, "button": False}
+    for zone in layout_spec.get("layout_zones", []):
+        zone_id = zone.get("zone_id", "")
+        zone_type = zone.get("zone_type", "visual")
+        if zone_type == "visual":
+            continue
+        if zone_id.startswith("title") and not used["title"]:
+            _draw_zone_text(draw, title, zone, (canvas_w, canvas_h))
+            used["title"] = True
+        elif zone_id.startswith("subtitle") and not used["subtitle"]:
+            _draw_zone_text(draw, subtitle, zone, (canvas_w, canvas_h))
+            used["subtitle"] = True
+        elif zone_type == "button" and not used["button"]:
+            _draw_zone_button(draw, cta, zone, theme)
+            used["button"] = True
+
+    return canvas
+
+def make_poster_any(bg_source, title, subtitle, cta, size_key="banner", plan: dict = None,
+                    use_dynamic: bool = False) -> Image.Image:
+    """bg_source 可以是 URL 字符串 或 PIL Image（运营上传图）
+    use_dynamic=True 时才走参考图动态排版（模式一生图后叠字用），
+    默认走 template_id 固定版式（模式二图片放槽位+文字替换）。
+    """
+    if use_dynamic:
+        spec = _get_layout_spec(plan, size_key)
+        if spec:
+            return make_poster_dynamic(bg_source, title, subtitle, cta, spec, plan)
+    # 模板系统：bg_source 作为图片槽位内容，版式由 template_id 决定
+    if isinstance(bg_source, Image.Image):
+        w, h = SIZES.get(size_key, (1160, 1016))
         visual = _plan_visual(plan)
         if size_key == "square" and visual.get("template_id") == "home_vertical_promo":
             bg_img = bg_source.convert("RGB")
@@ -509,7 +606,18 @@ def make_poster_any(bg_source, title, subtitle, cta, size_key="banner", plan: di
     return make_poster(bg_source, title, subtitle, cta, size_key, plan)
 
 
+def render_generated_only(bg_source, size_key: str = "banner", custom_size: tuple[int, int] | None = None) -> Image.Image:
+    """直接输出生成图本身，不再叠加任何固定版式或文案。"""
+    target_size = custom_size or SIZES[size_key]
+    if isinstance(bg_source, Image.Image):
+        return _prepare_background(bg_source.convert("RGB"), target_size)
+    if bg_source:
+        return _prepare_background(_fetch_image(bg_source), target_size)
+    return Image.new("RGB", target_size, (30, 30, 60))
+
+
 def _compose(bg: Image.Image, title: str, subtitle: str, cta: str, size_key: str, plan: dict = None) -> Image.Image:
+
     """内部排版逻辑，bg 已是目标尺寸 RGB Image"""
     w, h = bg.size
     source_bg = bg.copy()
