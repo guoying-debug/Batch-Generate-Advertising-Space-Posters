@@ -15,17 +15,30 @@ def _pil_to_cv2(img: Image.Image):
     return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
 
+def _normalize_bbox(bbox, min_width=1, min_height=1):
+    """规整 bbox，确保 x1 < x2, y1 < y2，且最小宽高"""
+    x1, y1, x2, y2 = bbox
+    x1, x2 = min(x1, x2), max(x1, x2)
+    y1, y2 = min(y1, y2), max(y1, y2)
+    if x2 - x1 < min_width:
+        x2 = x1 + min_width
+    if y2 - y1 < min_height:
+        y2 = y1 + min_height
+    return [x1, y1, x2, y2]
+
+
 def _scale_bbox(bbox, src_size, dst_size):
     """把 bbox [x1,y1,x2,y2] 从 src_size 比例映射到 dst_size"""
     sw, sh = src_size
     dw, dh = dst_size
     x1, y1, x2, y2 = bbox
-    return [
+    scaled = [
         round(x1 * dw / sw),
         round(y1 * dh / sh),
         round(x2 * dw / sw),
         round(y2 * dh / sh),
     ]
+    return _normalize_bbox(scaled)
 
 
 def _bbox_height(bbox):
@@ -238,14 +251,14 @@ def _infer_visual_zone(text_bboxes: List[list], canvas_w: int, canvas_h: int) ->
     # 如果文字区集中在左侧（左文右图）
     if text_x2_max < canvas_w * 0.55:
         return {"zone_id": "visual_zone", "zone_type": "visual",
-                "bbox": [text_x2_max, 0, canvas_w, canvas_h], "strategy": "full_background"}
+                "bbox": _normalize_bbox([text_x2_max, 0, canvas_w, canvas_h]), "strategy": "full_background"}
     # 文字区集中在右侧
     if text_x1_min > canvas_w * 0.45:
         return {"zone_id": "visual_zone", "zone_type": "visual",
-                "bbox": [0, 0, text_x1_min, canvas_h], "strategy": "full_background"}
+                "bbox": _normalize_bbox([0, 0, text_x1_min, canvas_h]), "strategy": "full_background"}
     # 居中布局 → 全背景
     return {"zone_id": "visual_zone", "zone_type": "visual",
-            "bbox": [0, 0, canvas_w, canvas_h], "strategy": "full_background"}
+            "bbox": _normalize_bbox([0, 0, canvas_w, canvas_h]), "strategy": "full_background"}
 
 
 def _template_summary(visual_zone: dict, canvas_w: int) -> str:
@@ -308,8 +321,8 @@ def derive_layout(banner_spec: dict, target_size: Tuple[int, int]) -> dict:
 
         new_zones.append({
             **z,
-            "bbox": [new_x1, new_y1, new_x2, new_y2],
-            "font_size_range": _font_size_from_height(new_y2 - new_y1),
+            "bbox": _normalize_bbox([new_x1, new_y1, new_x2, new_y2]),
+            "font_size_range": _font_size_from_height(max(1, new_y2 - new_y1)),
         })
 
     return {

@@ -104,6 +104,7 @@ def step_extract_and_write(url, operator_text, gallery_files, reference_files):
             notes.append("视频下载失败或超限，已降级用封面+元数据")
 
     reference_images = _load_gallery(reference_files)
+    first_reference = reference_images[0] if reference_images else None
     reference_analysis = ai_writer.analyze_reference_images(reference_images)
 
     poster_goal = "教程推广" if _is_video(url) else "活动推广"
@@ -121,11 +122,9 @@ def step_extract_and_write(url, operator_text, gallery_files, reference_files):
     if reference_analysis:
         poster_plan["reference_analysis"] = reference_analysis
     copy = ai_writer.normalize_plan_to_legacy_fields(poster_plan)
-    detail = ai_writer.plan_to_detail(poster_plan, content, operator_text)
-
     gallery_images = _load_gallery(gallery_files)
     candidate_entries = _build_candidate_entries(content, frames, gallery_images)
-    theme = _theme_from_plan(poster_plan, copy["title"], detail)
+    theme = _theme_from_plan(poster_plan, copy["title"], {})
     ranked_candidates = ai_writer.rank_candidate_images(candidate_entries, theme, topk=8)
     candidate_choices = _candidate_choice_list(ranked_candidates)
     link_images = content.get("images", [])
@@ -155,9 +154,6 @@ def step_extract_and_write(url, operator_text, gallery_files, reference_files):
         copy["cta"],
         copy.get("image_prompt", ""),
         copy.get("image_render_prompt", copy.get("image_prompt", "")),
-        detail,
-        detail.get("image_prompt", copy.get("image_prompt", "")),
-        copy.get("detail_render_prompt", detail.get("image_prompt", copy.get("image_prompt", ""))),
         copy.get("square_prompt", copy.get("image_prompt", "")),
         copy.get("square_render_prompt", copy.get("square_prompt", copy.get("image_prompt", ""))),
         json.dumps(poster_plan, ensure_ascii=False, indent=2),
@@ -172,6 +168,7 @@ def step_extract_and_write(url, operator_text, gallery_files, reference_files):
         video_summary,                 # video_summary_state
         poster_plan,                   # poster_plan_state
         reference_analysis,            # reference_analysis_state
+        first_reference,               # reference_img_state
         (_pick_note(ranked_candidates[0], "系统预选最高分") if ranked_candidates else "暂无可评分候选图"),
     )
 
@@ -325,7 +322,6 @@ def load_plan_template(template_name):
         raise gr.Error("未找到对应模板")
     legacy = ai_writer.normalize_plan_to_legacy_fields(plan)
     compact = ai_writer.compact_copywriting(plan)
-    detail = ai_writer.plan_to_detail(plan)
     event_info = plan.get("event_info", {})
     reference_analysis = {
         "summary": plan.get("reference_style_summary", ""),
@@ -347,13 +343,10 @@ def load_plan_template(template_name):
         legacy.get("image_render_prompt", legacy.get("image_prompt", "")),
         legacy.get("square_prompt", ""),
         legacy.get("square_render_prompt", legacy.get("square_prompt", "")),
-        legacy.get("detail_prompt", ""),
-        legacy.get("detail_render_prompt", legacy.get("detail_prompt", "")),
         _reference_info_text(reference_analysis),
         "\n".join(event_info.get("benefits", [])),
         event_info.get("event_time", ""),
         compact.get("cta", "立即查看"),
-        detail,
         f"已加载模板：{name}",
         plan,
         reference_analysis,
@@ -361,10 +354,9 @@ def load_plan_template(template_name):
 
 
 def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, image_render_prompt,
-              square_prompt, square_render_prompt, detail_state, detail_prompt, detail_render_prompt, candidates_state, gallery_files,
-              candidate_choice, poster_plan_text, poster_plan_state, layout_engine="固定模板（换图换字，复刻参考图版式结构）"):
-    """③ 合成 banner + 方图 + 详情页长图"""
-    detail = detail_state or {}
+              square_prompt, square_render_prompt, candidates_state, gallery_files,
+              candidate_choice, poster_plan_text, poster_plan_state, layout_engine="固定模板（换图换字，复刻参考图版式结构）", reference_img=None):
+    """③ 合成 banner + 方图"""
     pick_note = ""
     plan = _parse_plan_text(poster_plan_text, poster_plan_state)
     legacy = ai_writer.normalize_plan_to_legacy_fields(plan)
@@ -372,8 +364,6 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
     banner_render_prompt = image_render_prompt.strip() or legacy.get("image_render_prompt", banner_prompt)
     square_prompt = square_prompt.strip() or legacy.get("square_prompt", banner_prompt)
     square_render_prompt = square_render_prompt.strip() or legacy.get("square_render_prompt", square_prompt or banner_render_prompt)
-    detail_prompt = detail_prompt.strip() or legacy.get("detail_prompt", square_prompt)
-    detail_render_prompt = detail_render_prompt.strip() or legacy.get("detail_render_prompt", detail_prompt or square_render_prompt)
     visual = plan.get("visual_strategy", {})
     ranked_candidates = candidates_state or []
 
@@ -431,32 +421,27 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
             selection_mode = "手动点选使用" if selected else "系统自动使用最高分"
             pick_note = _pick_note(chosen, selection_mode)
 
-    # 详情页头图背景：模式一优先沿用同一输入图策略，失败时自动复用 Banner 背景
-    if used_ai_gen and detail_render_prompt and detail_render_prompt.strip():
+    # 模式2：若有参考图，先重绘干净背景，再统一由 poster_maker 叠字
+    if mode != MODE1 and reference_img is not None:
         try:
-            detail_bg, detail_method = _generate_mode1_background(
-                detail_render_prompt.strip(),
-                generation_source if mode == MODE1 else None,
-                text_size="1440x720",
-                plan=plan, size_key="detail",
-            )
-            if mode == MODE1:
-                pick_note = f"{pick_note} | 详情页:{detail_method}"
+            ref_analysis = (plan or {}).get("reference_analysis") or {}
+            banner_zones = (ref_analysis.get("layout_specs") or {}).get("banner", {}).get("layout_zones")
+            square_zones = (ref_analysis.get("layout_specs") or {}).get("square", {}).get("layout_zones")
+            banner_bg = image_gen.generate_background_template_recompose(
+                reference_img, title, subtitle, cta, plan, layout_zones=banner_zones)
+            square_bg = image_gen.generate_background_template_recompose(
+                reference_img, title, subtitle, cta, plan, layout_zones=square_zones)
+            pick_note = (pick_note or "") + " | 参考图风格重绘完成"
         except Exception as e:
-            print(f"[app] 详情页背景生成失败，复用 Banner: {e}")
-            detail_bg = banner_bg
-            if mode == MODE1:
-                pick_note = f"{pick_note} | 详情页:生成失败，已复用Banner背景"
-    else:
-        detail_bg = banner_bg
+            print(f"[app] 模式2模板复刻失败，使用原图: {e}")
 
-    # 模式1和模式2统一使用文字叠加版式
-    # layout_engine 含「动态」时走 layout_specs 坐标贴合，否则走 template_id 固定模板
-    use_dynamic = "动态" in (layout_engine or "")
+    use_dynamic = layout_engine == "动态贴合（图铺满背景，文字按参考图坐标叠加）"
+    copy = ai_writer.normalize_plan_to_legacy_fields(plan)
+    banner_img = poster_maker.make_poster_any(banner_bg, copy["title"], copy["subtitle"], copy["cta"], "banner", plan, use_dynamic=use_dynamic)
+    square_img = poster_maker.make_poster_any(square_bg, copy["title"], copy["subtitle"], copy["cta"], "square", plan, use_dynamic=use_dynamic)
     return (
-        poster_maker.make_poster_any(banner_bg, title, subtitle, cta, "banner", plan, use_dynamic=use_dynamic),
-        poster_maker.make_poster_any(square_bg, title, subtitle, cta, "square", plan, use_dynamic=use_dynamic),
-        poster_maker.make_detail_page(detail_bg, detail, plan=plan),
+        banner_img,
+        square_img,
         pick_note or "合成完成",
     )
 
@@ -530,6 +515,7 @@ def _compare_conflict_warnings(slot_results: list) -> list:
 
 def _compare_slot_outputs(slot_name: str, content: dict, operator_text: str, poster_goal: str, bg_source, reference_files):
     reference_images = _load_gallery(reference_files)
+    first_reference = reference_images[0] if reference_images else None  # 保存第一张参考图供模式2使用
     has_reference = bool(reference_images)
     reference_analysis = ai_writer.analyze_reference_images(reference_images)
     plan = ai_writer.generate_poster_plan(
@@ -598,11 +584,11 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
     )
 
     cover_state = gr.State("")
-    detail_state = gr.State({})
     candidates_state = gr.State([])
     video_summary_state = gr.State("")
     poster_plan_state = gr.State({})
     reference_analysis_state = gr.State({})
+    reference_img_state = gr.State(None)  # 第一张参考图，供模式2图生图使用
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -629,8 +615,6 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
             render_prompt_box = gr.Textbox(label="Banner安全生图提示词（模式一实际使用）", lines=2)
             square_prompt_box = gr.Textbox(label="方图海报策划提示词（审核用）", lines=2)
             square_render_prompt_box = gr.Textbox(label="方图安全生图提示词（模式一实际使用）", lines=2)
-            detail_prompt_box = gr.Textbox(label="详情页海报策划提示词（审核用）", lines=3)
-            detail_render_prompt_box = gr.Textbox(label="详情页安全生图提示词（模式一实际使用）", lines=3)
             plan_box = gr.Textbox(label="poster_plan（可审核和手改 JSON）", lines=18)
             reference_box = gr.Textbox(label="参考图分析结果", lines=6, interactive=False)
             gr.Markdown("**活动页字段命中结果**")
@@ -653,7 +637,6 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
             rank_reason_box = gr.Textbox(label="TopN 排序理由", lines=6, interactive=False, visible=True)
             banner_out = gr.Image(label="横幅  2560 × 320", type="pil")
             square_out = gr.Image(label="方图  1160 × 1016", type="pil")
-            detail_out = gr.Image(label="详情页长图  1080 × 动态", type="pil")
 
     gr.Markdown("---")
     gr.Markdown("## 风格对比测试页\n同一条内容、同一张底图，分别套 3 组参考图，直接比较模板识别、版式变化和预览差异。")
@@ -691,10 +674,10 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
         step_extract_and_write,
         inputs=[url, op_text, gallery, reference_gallery],
         outputs=[cover_state, info_box, title_box, subtitle_box, cta_box,
-                 prompt_box, render_prompt_box, detail_state, detail_prompt_box, detail_render_prompt_box, square_prompt_box, square_render_prompt_box, plan_box, reference_box,
+                 prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box, plan_box, reference_box,
                  benefits_box, event_time_box, activity_cta_box,
                  candidate_gallery, candidate_choice, rank_reason_box, candidates_state, video_summary_state, poster_plan_state, reference_analysis_state,
-                 pick_box],
+                 reference_img_state, pick_box],
     )
     candidate_gallery.select(
         on_candidate_select,
@@ -710,15 +693,15 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
         load_plan_template,
         inputs=[template_dropdown],
         outputs=[plan_box, title_box, subtitle_box, cta_box, prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box,
-                 detail_prompt_box, detail_render_prompt_box, reference_box, benefits_box, event_time_box, activity_cta_box,
-                 detail_state, pick_box, poster_plan_state, reference_analysis_state],
+                 reference_box, benefits_box, event_time_box, activity_cta_box,
+                 pick_box, poster_plan_state, reference_analysis_state],
     )
     make_btn.click(
         step_make,
         inputs=[cover_state, title_box, subtitle_box, cta_box, mode, upload_img,
-                prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box, detail_state, detail_prompt_box, detail_render_prompt_box,
-                candidates_state, gallery, candidate_choice, plan_box, poster_plan_state, layout_engine],
-        outputs=[banner_out, square_out, detail_out, pick_box],
+                prompt_box, render_prompt_box, square_prompt_box, square_render_prompt_box,
+                candidates_state, gallery, candidate_choice, plan_box, poster_plan_state, layout_engine, reference_img_state],
+        outputs=[banner_out, square_out, pick_box],
     )
     compare_btn.click(
         generate_style_comparison,
@@ -732,4 +715,4 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(inbrowser=True)
+    demo.queue(default_concurrency_limit=1, max_size=16).launch(inbrowser=True)

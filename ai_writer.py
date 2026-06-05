@@ -255,6 +255,28 @@ def _find_size_prompt(plan: dict, size: str, default: str = "") -> str:
     return default
 
 
+def _build_render_prompt(prompt: str) -> str:
+    """把审核用提示词转成模式一实际使用的背景生图提示词。"""
+    text = (prompt or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"[\"'“”‘’「」][^\"'“”‘’「」]{1,120}[\"'“”‘’「」]", "", text)
+    patterns = [
+        r"(顶部|上方|底部|下方|左侧|右侧|左上角|右上角|左下角|右下角|中央|居中)[^，。；\n]{0,40}(主标题|副标题|标题|按钮文案|按钮文字|按钮|品牌小字|标签小字|角标|底部信息)[^，。；\n]{0,50}",
+        r"(主标题|副标题|标题|按钮文案|按钮文字|按钮|品牌小字|标签小字|角标|底部信息)[^，。；\n]{0,60}",
+        r"按重要性[^，。；\n]{0,60}",
+        r"字号[^，。；\n]{0,40}",
+        r"换行[^，。；\n]{0,40}",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text)
+
+    text = re.sub(r"\s+", " ", text).strip(" ，。；")
+    suffix = "。仅生成海报背景与主体，不生成任何文字、字母、数字、logo、按钮、水印或UI，保留清晰文字安全区。"
+    return (text + suffix).strip()
+
+
 def _clean_copy_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     text = re.sub(r"[【】\[\]（）()]+", "", text)
@@ -622,13 +644,19 @@ def generate_poster_plan(
 def normalize_plan_to_legacy_fields(plan: dict) -> dict:
     plan = _normalize_plan(plan)
     compact = compact_copywriting(plan)
+    image_prompt = _find_size_prompt(plan, "2560x320", "")
+    square_prompt = _find_size_prompt(plan, "1160x1016", "")
+    detail_prompt = _find_size_prompt(plan, "1080x1440", square_prompt)
     return {
         "title": compact.get("title", ""),
         "subtitle": compact.get("subtitle", ""),
         "cta": compact.get("cta", "立即查看"),
-        "image_prompt": _find_size_prompt(plan, "2560x320", ""),
-        "square_prompt": _find_size_prompt(plan, "1160x1016", ""),
-        "detail_prompt": _find_size_prompt(plan, "1080x1440", _find_size_prompt(plan, "1160x1016", "")),
+        "image_prompt": image_prompt,
+        "image_render_prompt": _build_render_prompt(image_prompt),
+        "square_prompt": square_prompt,
+        "square_render_prompt": _build_render_prompt(square_prompt),
+        "detail_prompt": detail_prompt,
+        "detail_render_prompt": _build_render_prompt(detail_prompt),
     }
 
 

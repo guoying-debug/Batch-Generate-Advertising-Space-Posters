@@ -1,114 +1,181 @@
 # 广告位海报批量生成工具
 
-根据 B 站视频链接、酷家乐活动页或任意网页，自动理解内容并生成广告位海报（横幅 + 方图 + 详情页长图）。
+根据链接内容、视频画面、参考图风格和候选素材，自动生成广告位海报。
+
+当前主界面输出两种规格：
+
+- Banner：2560 x 320
+- Square：1160 x 1016
 
 ![alt text](image.png)
 
-## 已实现功能
+## 当前能力概览
 
-### 1. 链接内容提取（extractor.py）
+### 1. 链接理解（extractor.py + app.py）
 
-- **B 站视频**：调官方 API 提取标题、简介、封面图、标签
-- **普通网页 / 活动页**：解析 OG 标签、完整正文、页面所有图片
-- **活动页专属字段**：自动提取活动标题、副标题、活动时间、福利亮点、CTA 按钮文案
-- **URL 清洗**：自动从微信 / APP 分享文本（如「【标题】 链接」）中提取真实 URL，支持直接粘贴分享文字
+- 支持直接粘贴 URL，也支持粘贴微信 / APP 分享文本，自动抽取真实链接
+- 对 B 站链接走官方 API，提取标题、简介、封面和关键词
+- 对普通网页 / 活动页抓取 OG 信息、完整正文和页面图片列表
+- 自动提取活动页结构化字段：活动标题、副标题、福利、活动时间、CTA 文案
+- `app.py` 会识别视频类链接（B 站、YouTube、腾讯视频、抖音等）并进入视频理解流程
 
-### 2. 视频深度理解（media.py）
+说明：
 
-- 用 yt-dlp 下载视频流（≤10 分钟 / ≤100 MB），同步尝试下载平台字幕
-- OpenCV 均匀抽帧（默认 5 帧），跳过纯黑/白帧
-- 字幕优先，无字幕则用 faster-whisper（tiny 模型）本地 ASR 转写前 3 分钟
-- **视频下载失败自动降级**：封面图 + 元数据照样生成海报，不影响主流程
+- 结构化网页提取目前只对 B 站做了专门 API 适配
+- 其他视频站点主要依赖通用网页抓取 + `yt-dlp` 下载理解
+
+### 2. 视频理解（media.py）
+
+- 使用 `yt-dlp` 下载视频或音频流，默认限制为 10 分钟 / 100 MB
+- 自动尝试下载平台字幕，字幕优先于 ASR
+- 用 OpenCV 均匀抽帧，默认 5 帧，并过滤纯黑 / 纯白空帧
+- 无字幕时使用 `faster-whisper` 本地转写前 3 分钟内容
+- 下载失败会自动降级为“封面图 + 元数据”方案，不阻断主流程
 
 ### 3. AI 文案与海报策划（ai_writer.py）
 
-- 视觉模型（GLM-4V-Flash）一次性理解多帧画面，输出视频内容/风格描述
-- 封面图语义描述，补充文案生成语境
-- **参考图驱动设计（核心架构升级）**：
-  - **AI 风格分析**：识别参考图的模板 ID、版式签名、视觉语言、配色方案
-  - **OCR 布局提取（PaddleOCR）**：精确识别参考图中文字区域坐标、字号、颜色、对齐方式，生成结构化 `layout_spec` JSON
-  - **动态排版引擎**：按 `layout_spec` 的 `layout_zones` 把运营文案精准放入参考图的对应位置，无需手动调整
-  - **自动尺寸推导**：从 Banner 参考图自动推导出方图和详情页的布局规范（横向 → 纵向版式转换）
-  - **置信度机制**：OCR 识别置信度 < 0.5 时自动回退到固定模板系统，保证鲁棒性
-- 生成结构化 `poster_plan`，包含：主题摘要、海报类型、目标人群、核心卖点、文案（主标题/副标题/CTA/角标）、视觉策略（`template_id` / `banner_layout_mode` / `square_layout_mode` / `style_strength` / `decoration_density` / `overlay_strength`）、分尺寸提示词、**layout_specs**（含 banner/square/detail 三种尺寸的坐标规范）
-- 支持按主题从候选图池自动挑图（视觉模型打分，0-100），返回 TopN 排序理由
-- **文字设计规范**（防止生图出现乱码/多余文字）：
-  - 画面文字用引号包裹，防止模型自由发挥生成乱码
-  - 按重要性排序：主标题 → 副标题 → 角标 → 按钮 → 底部信息
-  - 明确字号层级：巨大主标题 → 中等副标题 → 小字底部信息
-  - 长句断成多段实现精准换行
+- 用视觉模型理解视频多帧内容，生成视频摘要
+- 用视觉模型理解封面图，补充语义上下文
+- 统一生成结构化 `poster_plan`
+- `poster_plan` 包含：
+  - `topic_summary`、`poster_type`、`audience`
+  - `copywriting`：主标题 / 副标题 / CTA / 角标
+  - `visual_strategy`：模板 ID、版式、配色、风格强度、蒙版强度等
+  - `size_adaptations`：各尺寸提示词
+  - `constraints`、`event_info`
+- 自动把审核用提示词转换成“安全生图提示词”，剥离文字排版描述，减少出图乱码
+- 提供兼容层，把新结构自动映射回旧字段（`title` / `subtitle` / `image_prompt` 等）
 
-### 4. 两种生成模式
+### 4. 参考图驱动设计（ai_writer.py + layout_analyzer.py + poster_maker.py）
+
+- 支持上传多张参考图，先做 AI 风格分析，再做 OCR 布局提取
+- AI 风格分析输出：
+  - `template_id`
+  - `layout_signature`
+  - `banner_layout_mode` / `square_layout_mode`
+  - `visual_language`
+  - `color_palette`
+  - `replaceable_slots` / `fixed_elements`
+- PaddleOCR 提取参考图文字区域，生成结构化 `layout_specs`
+- 自动从 Banner 参考图推导 Square / Detail 规格布局
+- OCR 置信度低于 0.5 时，自动回退到固定模板系统
+- 支持两种排版引擎：
+  - 固定模板：按模板版式重新排版
+  - 动态贴合：按参考图 OCR 坐标直接叠字
+
+### 5. 候选图评分与自动挑图（app.py + ai_writer.py）
+
+- 候选图来源包括：
+  - 运营上传图库
+  - 页面抓取图片
+  - 封面图
+  - 视频抽帧
+- 视觉模型对候选图按主题做 0-100 分评分
+- 返回 TopN 排序结果与简短理由
+- UI 中可点击候选图，手动指定最终底图
+
+### 6. 两种生成模式（app.py + image_gen.py）
 
 #### 模式一：智能生成背景图（有图走图生图，无图走文生图）
 
-适用场景：希望保留原图主体/构图关系并让 AI 重新生成更统一的背景，或无底图时直接生成全新背景。
+适用场景：
 
-流程：
+- 希望基于某张图重绘出更统一的广告背景
+- 没有底图时，直接根据提示词生成全新背景
 
-- 有输入图时：输入链接 → 理解内容 → 生成文案和分尺寸提示词 → **代理接口图生图**（`chat/completions` 格式）→ 合成海报
-- 无输入图时：输入链接 → 理解内容 → 生成文案和分尺寸提示词 → **代理接口文生图**（`images/generations` 格式）→ 合成海报
+实际流程：
 
-- 输入图来源以运营手动上传图为主；未上传时自动从候选图池中取最高分图，再无候选则直接文生图
-- Banner（2560×320）和方图（1160×1016）分别按各自提示词生成
-- 图生图失败时自动回退到文生图；若文生图也失败，则直接复用原图继续合成，避免流程中断
-- 详情页头图背景同步生成，失败时自动复用 Banner 背景
-- 支持异步任务模式（`IMAGE_PROXY_ASYNC=true`），自动轮询直到生图完成
+- 有上传图：优先图生图
+- 没有上传图但有候选图：默认取最高分候选图做图生图
+- 没有任何候选图：直接文生图
+- 图生图失败时回退文生图
+- 文生图也失败时，若有原图则直接复用原图继续合成
 
-#### 模式二：复用封面 / 素材图（背景 + 文字形式）
+补充说明：
 
-适用场景：有现成图库或视频封面，不需要生图。
+- 文生图 / 图生图统一调用代理图片接口
+- 支持异步任务轮询
+- 兼容 OpenAI images/generations 风格响应
+- 兼容 Gemini `inlineData` base64 图片响应
+- 可将 OCR 提取出的文字安全区注入生图提示词，约束留白
 
-流程：输入链接 → 抓取页面图片 + 抽视频帧 → 运营上传图库 → **AI 按主题自动挑最契合的图** → 合成海报
+#### 模式二：复用封面 / 素材图（自动挑图）
 
-- 图片来源：链接页面图片、视频抽帧、运营上传图库，三者合并为候选池
-- 活动页支持 `local_replace` 策略：Banner 用封面原图，方图用挑选图
-- 无任何候选图时报错提示，避免生成空白海报
+适用场景：
 
-### 5. 海报排版合成（poster_maker.py）
+- 不一定重新生图，优先复用已有图片快速出海报
+- 希望从页面图 / 图库 / 封面里自动挑一张最贴题的素材
 
-输出三种规格：
+实际流程：
+
+- 优先使用手动上传背景图
+- 否则从候选图中选择用户点选项或系统最高分项
+- 若开启参考图驱动且上传了参考图，会额外尝试“参考图风格重绘”
+- 若未上传参考图，则直接使用选中的素材进入排版
+
+注意：
+
+- 模式二不是“必须依赖参考图”的模式
+- 参考图是可选增强项，不是必填项
+
+### 7. 海报合成与动态排版（poster_maker.py）
+
+输出规格：
 
 | 规格 | 尺寸 | 说明 |
 |------|------|------|
-| 横幅 Banner | 2560 × 320 | 网站顶部广告位 |
-| 方图 | 1160 × 1016 | 信息流 / 落地页模块 |
-| 详情页长图 | 1080 × 动态高度 | 头图 + 多卖点卡片 + CTA |
+| Banner | 2560 x 320 | 顶部广告位 |
+| Square | 1160 x 1016 | 信息流 / 模块位 |
 
-排版特性：
-- 根据 `layout_mode` 自适应三种版式：`left_text_right_visual` / `top_text_bottom_visual` / `centered`
-- 支持角标、活动时间、福利列表渲染
-- 文字自适应字号（保证不超出安全区）
-- 全背景模式叠半透明蒙版保证文字可读性
+核心能力：
 
-### 6. 模板管理
+- 支持三种版式语义：`left_text_right_visual` / `top_text_bottom_visual` / `centered`
+- 支持 `reference_editorial` / `reference_bold` / `reference_showcase` 等模板风格
+- 支持活动时间、角标、CTA 按钮渲染
+- 支持参考图主题色驱动的文字色、按钮色、卡片色
+- 支持全背景加蒙版，保证文字可读性
+- 动态贴合模式下支持：
+  - bbox 内自适应字号
+  - 左 / 中 / 右对齐
+  - 顶部安全边距
+  - OCR 重复框去重
+  - `title_zone_2` 自动映射为副标题区域
 
-- 将当前 `poster_plan` JSON 保存为命名模板（`poster_plan_templates.json`）
-- 下次直接加载模板，跳过 AI 生成步骤，快速复用风格
-- 加载时自动还原文案、提示词、活动字段、参考图风格信息
+补充说明：
 
-### 7. 风格对比测试
+- 代码中还包含 `make_detail_page()` 详情页长图能力
+- `poster_plan` 也会生成 `1080x1440` 尺寸提示词
+- 但当前 Gradio 主界面尚未暴露详情页生成入口
 
-- 同一条内容 + 同一张底图，分别套 **三组参考图**，并排输出 Banner 和方图
-- 展示每组的模板识别结果、版式签名、视觉语言、配色等详细分析
-- 自动检测同版式冲突：若两组被判为同一模板/版式，给出明确警告，提示更换参考图
+### 8. 模板管理
 
-### 8. 审核与手动调整
+- 可将当前 `poster_plan` 保存为命名模板
+- 模板文件默认为运行目录下的 `poster_plan_templates.json`
+- 加载模板后可恢复：
+  - 文案
+  - 各尺寸提示词
+  - 活动字段
+  - 参考风格信息
 
-生成结果可在 UI 中直接修改后重新合成：
-- 主标题、副标题、CTA 文案
-- Banner / 方图 / 详情页海报策划提示词（审核用）和安全生图提示词（实际使用）分开展示
-- `poster_plan` 完整 JSON（支持手改后重新合成）
-- 候选图库：点击图片即可切换用于合成的底图
+### 9. 风格对比测试
 
----
+- 同一条内容 + 同一张底图，生成 A / B / C 三组对比结果
+- 每组可上传不同参考图，直接比较模板、版式和视觉语言差异
+- 会输出每组的参考图分析说明
+- 若两组被识别为相同模板 / 版式组合，会给出冲突警告
+
+### 10. 并发控制
+
+- `demo.queue(default_concurrency_limit=1, max_size=16)`
+- 用于限制并发请求，避免模型接口或 OCR 过载
 
 ## 快速开始
 
 ### 环境要求
 
-```
+```text
 Python 3.10+
+Windows（当前代码默认使用 Windows 字体路径）
 ```
 
 ### 安装依赖
@@ -117,84 +184,115 @@ Python 3.10+
 pip install -r requirements.txt
 ```
 
+当前依赖：
+
+- requests
+- beautifulsoup4
+- pillow
+- gradio
+- openai
+- python-dotenv
+- yt-dlp
+- opencv-python-headless
+- faster-whisper
+- paddlepaddle
+- paddleocr
+
 ### 配置环境变量
 
-新建 `.env` 文件：
+新建 `.env`：
 
 ```env
 ZHIPUAI_API_KEY=your_key_here
-# 可选覆盖默认值（文本/视觉模型仍走智谱）
 ZHIPUAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
 TEXT_MODEL=glm-4-flash-250414
 VISION_MODEL=glm-4v-flash
 
-# 模式一生图（文生图 + 图生图统一走代理接口，兼容 OpenAI images/generations 或 chat/completions 格式）
+# 图片代理接口
 IMAGE_PROXY_BASE_URL=https://your-proxy/v1/images/generations
 IMAGE_PROXY_API_KEY=your_proxy_key_here
-IMAGE_PROXY_MODEL=your-model-name          # 默认 nano-banana-pro
-IMAGE_PROXY_IMG2IMG_URL=                   # 可选，图生图单独接口；缺省用 /v1/chat/completions
-IMAGE_PROXY_STATUS_URL_TEMPLATE=           # 可选，异步任务查询地址模板，含 {task_id}
-IMAGE_PROXY_ASYNC=false                    # 异步模式：true 时开启任务轮询
-IMAGE_PROXY_POLL_INTERVAL=2                # 轮询间隔（秒）
-IMAGE_PROXY_POLL_TIMEOUT=180              # 最长等待（秒）
+IMAGE_PROXY_MODEL=nano-banana-pro
+IMAGE_PROXY_IMG2IMG_URL=
+IMAGE_PROXY_STATUS_URL_TEMPLATE=
+IMAGE_PROXY_ASYNC=false
+IMAGE_PROXY_POLL_INTERVAL=2
+IMAGE_PROXY_POLL_TIMEOUT=180
 
+# 语音转写
 ASR_MODEL=tiny
+
 ```
+
+说明：
+
+- `IMAGE_PROXY_BASE_URL` 可直接填完整的 `/v1/images/generations` 地址
+- 若只填到根路径，代码也会自动补全
+- `IMAGE_PROXY_IMG2IMG_URL` 为空时，默认回退到 `/v1/chat/completions`
+- `app.py` 启动时会先关闭 Paddle oneDNN：`FLAGS_use_mkldnn=0`
 
 ### 启动
 
-```bash
+```powershell
+.\venv\Scripts\Activate.ps1
 python app.py
 ```
 
-浏览器自动打开 Gradio 界面。
+浏览器会自动打开 Gradio 界面。
 
----
+## 使用流程
 
-## 使用示例
+### 主流程
 
-**B 站视频 → 教程推广海报**
+1. 输入链接，支持网页、活动页、视频链接或分享文本
+2. 可选填写运营补充文案
+3. 可选上传：
+   - 运营图库
+   - 参考图
+   - 手动指定背景图
+4. 点击 `① 读取链接 + 理解内容 + 生成文案`
+5. 在审核区检查并修改：
+   - 主标题 / 副标题 / CTA
+   - Banner / Square 审核用提示词
+   - Banner / Square 安全生图提示词
+   - `poster_plan` JSON
+6. 选择生成模式与排版引擎
+7. 点击 `③ 合成海报`
 
-1. 粘贴 B 站链接，如 `https://www.bilibili.com/video/BV11C411H7PM/`
-2. 可选填运营补充文案，如「3分钟解锁异形门衣柜」
-3. 可选上传参考海报（多张），AI 将学习其版式和风格
-4. 点击「① 读取链接 + 理解内容 + 生成文案」
-5. 选择模式一（智能生成背景图）或模式二（复用封面）
-6. 模式一可上传一张背景图作为底图：有图时走图生图，无图时自动文生图
-7. 点击「③ 合成海报」
+### 审核区可手改内容
 
-**酷家乐活动页 → 活动推广广告位**
+- 主标题
+- 副标题
+- CTA
+- `poster_plan` JSON
+- Banner / Square 审核用提示词
+- Banner / Square 安全生图提示词
 
-1. 粘贴活动链接，如 `https://www.kujiale.com/festatic/duDbbNQfoXJmdDMb`
-2. 工具自动提取活动标题、时间、福利、CTA
-3. 模式二下会从页面图片中挑选最符合活动主题的图作为背景
-4. 模式一可上传一张底图做图生图，得到更统一的广告视觉
+### 风格对比页
 
-**风格对比测试**
-
-1. 在页面下方「风格对比测试页」填入链接
-2. 上传同一张底图（保证公平对比）
-3. 分别给 A/B/C 三组上传不同风格的参考海报（A 组可留空作为基线）
-4. 点击「生成风格对比」，并排查看三组版式差异
-
----
+1. 输入同一条链接
+2. 上传统一底图
+3. 分别上传 A / B / C 三组参考图
+4. 点击生成，对比不同参考风格的实际效果
 
 ## 项目结构
 
-```
-├── app.py              # Gradio UI 与主流程编排
-├── extractor.py        # 链接内容提取（B站API + 通用网页）
-├── ai_writer.py        # 文案生成、海报策划、图片打分挑选、参考图风格分析
-├── layout_analyzer.py  # 参考图 OCR 布局提取，生成结构化 layout_spec，并推导各尺寸版式
-├── image_gen.py        # 模式一：代理接口文生图 + 图生图（含异步轮询）
-├── poster_maker.py     # 海报合成排版（Banner / 方图 / 详情页，含动态排版引擎）
-├── media.py            # 视频下载、抽帧、语音转写
-├── requirements.txt
-└── .env                # API密钥（不入库）
+```text
+├── app.py                       # Gradio UI、状态管理、主流程编排
+├── extractor.py                 # 链接提取：B站 API + 通用网页抓取
+├── media.py                     # 视频下载、抽帧、字幕 / ASR 转写
+├── ai_writer.py                 # 海报策划、文案生成、参考图分析、候选图评分
+├── layout_analyzer.py           # OCR 布局提取与跨尺寸布局推导
+├── image_gen.py                 # 文生图、图生图、异步轮询、代理响应兼容
+├── poster_maker.py              # Banner / Square 合成、动态贴合、详情页长图
+├── requirements.txt             # Python 依赖
+├── README.md
+├── image.png                    # README 截图
+├── .env                         # 本地环境变量，不入库
+└── poster_plan_templates.json   # 运行后按需生成的模板文件
 ```
 
-进入虚拟环境
+## 备注
 
-```powershell
-.\venv\Scripts\Activate.ps1
-```
+- 当前代码明显以 Windows 本地运行环境为主
+- 字体路径默认读取 `C:/Windows/Fonts/...`
+- 如果要迁移到 Linux / macOS，需要先调整字体加载与相关环境依赖

@@ -127,6 +127,42 @@ def _fit_wrapped_text(
     return best_font, best_lines[:max_lines]
 
 
+def _fit_text_block(
+    text: str,
+    draw: ImageDraw.ImageDraw,
+    max_width: int,
+    max_height: int,
+    max_lines: int,
+    max_size: int,
+    min_size: int,
+):
+    """同时约束宽度和高度，返回可放入 bbox 的字号与换行结果。"""
+    text = (text or "").strip()
+    best_font = _load_font(min_size)
+    best_lines = [text] if text else [""]
+    best_line_gap = 4
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+    max_lines = max(1, int(max_lines))
+
+    for size in range(max_size, min_size - 1, -1):
+        font = _load_font(size)
+        lines = _wrap_by_width(text, font, max_width, draw) if text else [""]
+        if not lines:
+            lines = [""]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+        asc, desc = font.getmetrics()
+        line_gap = max(2, size // 7)
+        total_h = len(lines) * (asc + desc) + max(0, len(lines) - 1) * line_gap
+        too_wide = any(draw.textlength(line, font=font) > max_width for line in lines)
+        if not too_wide and total_h <= max_height and len(lines) <= max_lines:
+            return font, lines, line_gap
+        best_font, best_lines, best_line_gap = font, lines, line_gap
+
+    return best_font, best_lines, best_line_gap
+
+
 def _darken(img: Image.Image, alpha: int = 120) -> Image.Image:
     """叠一层半透明黑色蒙版，让文字更清晰"""
     overlay = Image.new("RGBA", img.size, (0, 0, 0, alpha))
@@ -524,15 +560,52 @@ def _draw_zone_text(draw: ImageDraw.ImageDraw, text: str, zone: dict, canvas_siz
     except Exception:
         color = (255, 255, 255)
 
-    # 确保文字不超出 bbox（换行后最多填满高度）
-    wrapped = _wrap_by_width(text, font, max_w, draw)
-    line_h = sum(font.getmetrics()) + 4
-    y = y1
+    # 靠近顶部的标题区域强制留出安全边距，避免字体上沿被裁掉。
+    top_safe = max(12, int(canvas_size[1] * 0.04))
+    if y1 < top_safe:
+        y1 = top_safe
+        max_h = max(y2 - y1, 1)
+
+    max_lines = 1 if max_h <= max(font.size + 8, 36) else 2
+    font, wrapped, line_gap = _fit_text_block(
+        text, draw, max_w, max_h, max_lines, fsize_range[1], fsize_range[0]
+    )
+    asc, desc = font.getmetrics()
+    total_h = len(wrapped) * (asc + desc) + max(0, len(wrapped) - 1) * line_gap
+    y = y1 + max(0, (max_h - total_h) // 2)
+    align = (zone.get("alignment") or "left").lower()
+
     for line in wrapped:
-        if y + line_h > y2 + line_h:  # 超出区域就截断
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_w = bbox[2] - bbox[0]
+        if align == "center":
+            draw_x = x1 + max(0, (max_w - line_w) // 2)
+        elif align == "right":
+            draw_x = x2 - line_w
+        else:
+            draw_x = x1
+        draw_y = y - bbox[1]
+        if draw_y + (bbox[3] - bbox[1]) > y2:
             break
-        draw.text((x1, y), line, font=font, fill=color)
-        y += line_h
+        draw.text((draw_x, draw_y), line, font=font, fill=color)
+        y += (asc + desc) + line_gap
+
+
+def _dedupe_zones(zones: list[dict]) -> list[dict]:
+    """去掉 OCR 重复框，避免同一块区域被重复占用。"""
+    seen = set()
+    cleaned = []
+    for zone in zones or []:
+        key = (
+            zone.get("zone_type"),
+            tuple(zone.get("bbox") or []),
+            (zone.get("alignment") or "").lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(zone)
+    return cleaned
 
 
 def _draw_zone_button(draw: ImageDraw.ImageDraw, text: str, zone: dict, theme: dict):
@@ -566,19 +639,23 @@ def make_poster_dynamic(bg_source, title: str, subtitle: str, cta: str,
 
     draw = ImageDraw.Draw(canvas)
 
+    zones = _dedupe_zones(layout_spec.get("layout_zones", []))
     used = {"title": False, "subtitle": False, "button": False}
-    for zone in layout_spec.get("layout_zones", []):
+    for zone in zones:
         zone_id = zone.get("zone_id", "")
         zone_type = zone.get("zone_type", "visual")
         if zone_type == "visual":
             continue
-        if zone_id.startswith("title") and not used["title"]:
-            _draw_zone_text(draw, title, zone, (canvas_w, canvas_h))
-            used["title"] = True
-        elif zone_id.startswith("subtitle") and not used["subtitle"]:
+        if zone_id.startswith("subtitle") and not used["subtitle"]:
             _draw_zone_text(draw, subtitle, zone, (canvas_w, canvas_h))
             used["subtitle"] = True
-        elif zone_type == "button" and not used["button"]:
+        elif zone_id.startswith("title_zone_2") and not used["subtitle"]:
+            _draw_zone_text(draw, subtitle, zone, (canvas_w, canvas_h))
+            used["subtitle"] = True
+        elif zone_id.startswith("title") and not used["title"]:
+            _draw_zone_text(draw, title, zone, (canvas_w, canvas_h))
+            used["title"] = True
+        elif zone_type == "button" and not used["button"] and (zone.get("original_text") or "").strip() not in {"2025", "KUJIALE"}:
             _draw_zone_button(draw, cta, zone, theme)
             used["button"] = True
 

@@ -9,7 +9,7 @@ import time
 import urllib.request
 
 import requests
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 
 
 def _enhance_generated(img: Image.Image) -> Image.Image:
@@ -256,6 +256,7 @@ def _source_to_generation_input(source):
 
 def _extract_image_url(data: dict) -> str:
     if isinstance(data, dict):
+        # OpenAI 格式: {"data": [{"url": ...} | {"b64_json": ...}]}
         images = data.get("data")
         if isinstance(images, list) and images:
             first = images[0]
@@ -268,7 +269,11 @@ def _extract_image_url(data: dict) -> str:
         for key in ("url", "image_url", "result_url"):
             if data.get(key):
                 return data[key]
-    raise RuntimeError(f"生图返回异常: {data}")
+        gemini_ref = _extract_gemini_inline_image_ref(data)
+        if gemini_ref:
+            return gemini_ref
+    summary = list(data.keys())[:12] if isinstance(data, dict) else type(data).__name__
+    raise RuntimeError(f"生图返回异常，未找到图片字段: {summary}")
 
 
 def _extract_task_id(data: dict) -> str:
@@ -283,7 +288,7 @@ def _extract_chat_image_ref(data: dict) -> str:
     try:
         message = (((data or {}).get("choices") or [])[0] or {}).get("message") or {}
     except Exception as exc:
-        raise RuntimeError(f"图生图返回异常: {data}") from exc
+        raise RuntimeError("图生图返回异常，choices.message 结构不可用") from exc
 
     images = message.get("images")
     if isinstance(images, list) and images:
@@ -324,7 +329,42 @@ def _extract_chat_image_ref(data: dict) -> str:
                 if match:
                     return match.group(1)
 
-    raise RuntimeError(f"图生图返回异常: {data}")
+    gemini_ref = _extract_gemini_inline_image_ref(data)
+    if gemini_ref:
+        return gemini_ref
+
+    summary = list(data.keys())[:12] if isinstance(data, dict) else type(data).__name__
+    raise RuntimeError(f"图生图返回异常，未找到图片字段: {summary}")
+
+
+def _extract_gemini_inline_image_ref(data: dict) -> str:
+    """兼容 Gemini 原始图片响应，提取 inlineData 中的 base64 图片。"""
+    if not isinstance(data, dict):
+        return ""
+
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if isinstance(content, dict):
+            parts = content.get("parts") or []
+        elif isinstance(content, list):
+            parts = content
+        else:
+            parts = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData") or {}
+            b64 = inline.get("data")
+            mime = inline.get("mimeType") or "image/png"
+            if b64:
+                return f"data:{mime};base64,{b64}"
+    return ""
 
 
 def _request_proxy_image(prompt: str, image=None, size: str = "2K") -> str:
@@ -517,12 +557,70 @@ def generate_background_img2img(image_prompt: str, input_image, size: str = "2K"
     """使用代理图片接口图生图。input_image 支持 PIL.Image、URL、data URL。"""
     safe_prompt = _sanitize_prompt_for_image_model(image_prompt, layout_zones)
     try:
-        image_ref = _request_proxy_chat_img2img(safe_prompt, image=input_image, size=size)
+        image_ref = _request_proxy_image(safe_prompt, image=input_image, size=size)
     except Exception as e:
         # #region debug-point D:img2img-error
         _debug_report("D", "图生图请求异常", {"error": str(e), "size": size})
         # #endregion
         raise
+    return _enhance_generated(_download_generated_image(image_ref))
+
+
+def _build_inpaint_mask(ref_img: Image.Image, layout_zones: list) -> Image.Image:
+    """根据 layout_zones 生成蒙版：文字/按钮区=黑色(重绘)，其余=白色(保留)"""
+    mask = Image.new("L", ref_img.size, 255)
+    draw = ImageDraw.Draw(mask)
+    for z in (layout_zones or []):
+        if z.get("zone_type") in ("text", "button"):
+            x1, y1, x2, y2 = z["bbox"]
+            pad = max(6, int((y2 - y1) * 0.1))
+            rx1 = max(0, min(x1 - pad, ref_img.width - 1))
+            ry1 = max(0, min(y1 - pad, ref_img.height - 1))
+            rx2 = max(rx1 + 1, min(x2 + pad, ref_img.width))
+            ry2 = max(ry1 + 1, min(y2 + pad, ref_img.height))
+            draw.rectangle([rx1, ry1, rx2, ry2], fill=0)
+    return mask
+
+
+def _get_proxy_edits_url() -> str:
+    return f"{_get_proxy_root_url()}/v1/images/edits"
+
+
+def _compact_response_text(resp: requests.Response, limit: int = 200) -> str:
+    text = (getattr(resp, "text", "") or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    return text[:limit]
+
+
+def generate_background_template_recompose(
+    reference_image,
+    title: str,
+    subtitle: str,
+    cta: str,
+    plan: dict,
+    layout_zones: list = None,
+) -> Image.Image:
+    """
+    模式2专用：以参考图为风格基准做图生图，复刻其背景风格与配色。
+    reference_image: 参考海报模板（PIL.Image / URL / data URL）
+    layout_zones: 兼容旧签名，当前实现未使用
+    """
+    ref_img = _source_to_image(reference_image)
+    ref_img.thumbnail((1024, 1024), Image.LANCZOS)
+
+    visual = (plan or {}).get("visual_strategy") or {}
+    ref_analysis = (plan or {}).get("reference_analysis") or {}
+    style_kw = ref_analysis.get("prompt_boost", "") or visual.get("visual_language", "")
+
+    prompt = (
+        f"参考这张图片的背景风格、装饰元素和配色方案，重新生成一张海报背景。"
+        f"标题文字为「{title}」，副标题为「{subtitle}」，按钮文字为「{cta}」。"
+        f"保持整体版式协调统一。{style_kw}"
+    ).strip()
+
+    image_ref = _request_proxy_image(prompt, image=ref_img, size="2K")
     return _enhance_generated(_download_generated_image(image_ref))
 
 
