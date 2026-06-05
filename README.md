@@ -154,3 +154,5 @@ python app.py
 ├── requirements.txt
 └── .env              # API密钥（不入库）
 ```
+进入虚拟环境
+.\venv\Scripts\Activate.ps1
