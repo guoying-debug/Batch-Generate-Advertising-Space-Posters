@@ -8,7 +8,7 @@ import extractor, ai_writer, image_gen, poster_maker, media
 
 load_dotenv()
 
-MODE1 = "模式一：AI生成背景图"
+MODE1 = "模式一：智能生成背景图（有图走图生图，无图走文生图）"
 MODE2 = "模式二：复用封面/素材图（自动挑图）"
 
 VIDEO_RE = re.compile(r"(bilibili\.com/video/|youtube\.com|youtu\.be|v\.qq\.com|douyin\.com)")
@@ -249,6 +249,27 @@ def _pick_note(cand, selection_mode: str):
     )
 
 
+def _generate_mode1_background(render_prompt: str, source_img, text_size: str, image_size: str = "2K"):
+    prompt = (render_prompt or "").strip()
+    if source_img is not None:
+        try:
+            return image_gen.generate_background_img2img(prompt, source_img, size=image_size), "图生图"
+        except Exception as e:
+            print(f"[app] 图生图失败，准备回退: {e}")
+            if prompt:
+                try:
+                    return image_gen.generate_background(prompt, size=text_size), "图生图失败，已回退文生图"
+                except Exception as fallback_e:
+                    print(f"[app] 文生图回退失败，直接使用原图: {fallback_e}")
+            return source_img, "图生图失败，已直接使用原图"
+    if not prompt:
+        raise gr.Error("缺少生图提示词，无法执行模式一。请先点①生成内容或手动填写安全生图提示词")
+    try:
+        return image_gen.generate_background(prompt, size=text_size), "文生图"
+    except Exception as e:
+        raise gr.Error(f"模式一背景生成失败：{e}") from e
+
+
 def _parse_plan_text(plan_text, poster_plan_state):
     if plan_text and str(plan_text).strip():
         try:
@@ -327,7 +348,7 @@ def load_plan_template(template_name):
 def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, image_render_prompt,
               square_prompt, square_render_prompt, detail_state, detail_prompt, detail_render_prompt, candidates_state, gallery_files,
               candidate_choice, poster_plan_text, poster_plan_state):
-    """③ 合成 banner + 方图 + 详情页长图（模式二自动挑图）"""
+    """③ 合成 banner + 方图 + 详情页长图"""
     detail = detail_state or {}
     pick_note = ""
     plan = _parse_plan_text(poster_plan_text, poster_plan_state)
@@ -342,28 +363,37 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
     ranked_candidates = candidates_state or []
 
     used_ai_gen = False
+    generation_source = None
 
     if mode == MODE1:
-        # 智能背景：手动图优先 → 候选图库 → AI 生图兜底
+        # 智能生成：有图优先图生图，无图再文生图
         if upload_img is not None:
-            banner_bg = upload_img
-            square_bg = upload_img
-            pick_note = "来源:手动上传 | 分数:人工指定 | 选择结果:使用上传图生成"
+            generation_source = upload_img
+            banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, generation_source, text_size="1440x720")
+            square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, generation_source, text_size="1024x1024")
+            used_ai_gen = banner_method != "图生图失败，已直接使用原图" or square_method != "图生图失败，已直接使用原图"
+            pick_note = (
+                "来源:手动上传 | 分数:人工指定 | "
+                f"Banner:{banner_method} | 方图:{square_method} | 选择结果:已基于上传图处理背景"
+            )
         else:
             selected = next((c for c in ranked_candidates if c.get("choice_label") == candidate_choice), None)
             chosen = selected or (ranked_candidates[0] if ranked_candidates else None)
             if chosen is not None:
-                banner_bg = chosen["item"]
-                square_bg = chosen["item"]
+                generation_source = chosen["item"]
+                banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, generation_source, text_size="1440x720")
+                square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, generation_source, text_size="1024x1024")
+                used_ai_gen = banner_method != "图生图失败，已直接使用原图" or square_method != "图生图失败，已直接使用原图"
                 selection_mode = "手动点选使用" if selected else "系统预选最高分（智能背景）"
-                pick_note = _pick_note(chosen, selection_mode)
+                pick_note = f"{_pick_note(chosen, selection_mode)} | Banner:{banner_method} | 方图:{square_method}"
             else:
-                if not banner_render_prompt:
-                    raise gr.Error("没有可用候选图，且缺少生图描述。请先点①生成、上传图片库或手动填写生图提示词")
-                banner_bg = image_gen.generate_background(banner_render_prompt, size="1440x720")
-                square_bg = image_gen.generate_background(square_render_prompt or banner_render_prompt, size="1024x1024")
+                banner_bg, banner_method = _generate_mode1_background(banner_render_prompt, None, text_size="1440x720")
+                square_bg, square_method = _generate_mode1_background(square_render_prompt or banner_render_prompt, None, text_size="1024x1024")
                 used_ai_gen = True
-                pick_note = "来源:AI安全生图提示词 | 分数:不适用 | 选择结果:无候选图，使用AI生成背景"
+                pick_note = (
+                    "来源:AI安全生图提示词 | 分数:不适用 | "
+                    f"Banner:{banner_method} | 方图:{square_method} | 选择结果:无候选图，已直接生成背景"
+                )
     else:
         # 模式二：图库优先 → 候选池，按主题自动挑最佳
         if upload_img is not None:
@@ -386,9 +416,21 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
             selection_mode = "手动点选使用" if selected else "系统自动使用最高分"
             pick_note = _pick_note(chosen, selection_mode)
 
-    # 详情页头图背景：只有真正用了AI生图时才再生成一张
+    # 详情页头图背景：模式一优先沿用同一输入图策略，失败时自动复用 Banner 背景
     if used_ai_gen and detail_render_prompt and detail_render_prompt.strip():
-        detail_bg = image_gen.generate_background(detail_render_prompt.strip(), size="1440x720")
+        try:
+            detail_bg, detail_method = _generate_mode1_background(
+                detail_render_prompt.strip(),
+                generation_source if mode == MODE1 else None,
+                text_size="1440x720",
+            )
+            if mode == MODE1:
+                pick_note = f"{pick_note} | 详情页:{detail_method}"
+        except Exception as e:
+            print(f"[app] 详情页背景生成失败，复用 Banner: {e}")
+            detail_bg = banner_bg
+            if mode == MODE1:
+                pick_note = f"{pick_note} | 详情页:生成失败，已复用Banner背景"
     else:
         detail_bg = banner_bg
 
@@ -402,8 +444,20 @@ def step_make(cover_url, title, subtitle, cta, mode, upload_img, image_prompt, i
 
 def on_mode_change(mode):
     if mode == MODE1:
-        return gr.update(label="手动指定背景图（可选，留空则智能挑图，无候选才AI生图）")
-    return gr.update(label="手动指定背景图（可选，留空则从图库/候选自动挑选）")
+        return (
+            gr.update(label="手动指定背景图（可选；有图走图生图，无图才文生图）"),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
+    return (
+        gr.update(label="手动指定背景图（可选，留空则从图库/候选自动挑选）"),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+        gr.update(visible=True),
+    )
 
 
 def _compare_reference_note(slot_name: str, reference_analysis: dict, plan: dict, copy: dict, has_reference: bool) -> str:
@@ -519,7 +573,10 @@ def generate_style_comparison(url, operator_text, compare_bg, ref_a_files, ref_b
 
 
 with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
-    gr.Markdown("## 酷家乐 · 广告位海报批量生成\n输入链接 → 视频多帧+语音理解 → 自动挑图 → 出海报+详情页")
+    gr.Markdown(
+        "## 酷家乐 · 广告位海报批量生成\n"
+        "输入链接 → 视频多帧+语音理解 → 自动挑图/图生图/文生图 → 出海报+详情页"
+    )
 
     cover_state = gr.State("")
     detail_state = gr.State({})
@@ -562,14 +619,14 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
             with gr.Row():
                 save_template_btn = gr.Button("保存当前模板")
                 load_template_btn = gr.Button("加载选中模板")
-            upload_img   = gr.Image(label="手动指定背景图（可选，留空则从图库/候选自动挑选）", type="pil")
+            upload_img   = gr.Image(label="手动指定背景图（可选；模式一有图走图生图，模式二直接排版）", type="pil")
             make_btn     = gr.Button("③ 合成海报", variant="primary")
 
         with gr.Column(scale=2):
-            pick_box = gr.Textbox(label="挑图结果", lines=1, interactive=False)
-            candidate_gallery = gr.Gallery(label="模式2候选图库（点击图片可选中）", columns=4, rows=2, height=320, object_fit="contain")
-            candidate_choice = gr.Radio(label="当前候选图选择", choices=[], interactive=True)
-            rank_reason_box = gr.Textbox(label="TopN 排序理由", lines=6, interactive=False)
+            pick_box = gr.Textbox(label="挑图结果", lines=1, interactive=False, visible=True)
+            candidate_gallery = gr.Gallery(label="模式2候选图库（点击图片可选中）", columns=4, rows=2, height=320, object_fit="contain", visible=True)
+            candidate_choice = gr.Radio(label="当前候选图选择", choices=[], interactive=True, visible=True)
+            rank_reason_box = gr.Textbox(label="TopN 排序理由", lines=6, interactive=False, visible=True)
             banner_out = gr.Image(label="横幅  2560 × 320", type="pil")
             square_out = gr.Image(label="方图  1160 × 1016", type="pil")
             detail_out = gr.Image(label="详情页长图  1080 × 动态", type="pil")
@@ -604,7 +661,7 @@ with gr.Blocks(title="酷家乐广告海报生成工具") as demo:
                     compare_c_banner = gr.Image(label="C组 Banner", type="pil")
                     compare_c_square = gr.Image(label="C组 方图", type="pil")
 
-    mode.change(on_mode_change, inputs=[mode], outputs=[upload_img])
+    mode.change(on_mode_change, inputs=[mode], outputs=[upload_img, pick_box, candidate_gallery, candidate_choice, rank_reason_box])
 
     extract_btn.click(
         step_extract_and_write,
